@@ -532,8 +532,32 @@ Access Gateway
     |
     v
 Website 2
+
 ```
 
 A compromise of Website 1 must therefore not automatically provide unrestricted access to Website 2.
 
 The Gateway remains the final enforcement point.
+
+## Admin Re-authentication
+
+Every privileged administrative action requires fresh authentication.
+
+The administrator must re-authenticate before performing:
+
+- MFA override
+- Emergency Connect
+- Session termination/revocation
+- Employee access changes
+- Security-policy changes
+- Other security-sensitive administrative operations
+
+Each successful re-authentication authorizes **one privileged action only**.
+
+After the action is completed, the elevated authorization expires and the administrator must re-authenticate before performing another privileged action.
+
+The administrator may remain logged into the administrative dashboard for convenience, but being logged into the dashboard does **not** provide permanent authorization to perform privileged operations.
+
+### Security Principle
+
+> **Admin login does not equal permanent administrative authorization. Every privileged action requires fresh proof of administrator identity.**
