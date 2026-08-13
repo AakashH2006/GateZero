@@ -12,6 +12,10 @@ The security architecture follows this principle:
 
 Website 2 does not depend on the Mini EDR and does not continuously monitor Website 1.
 
+### Out of Scope: Business Authorization
+
+This document covers how an employee securely reaches an authenticated Website 2 session. It does not cover what an authenticated employee is permitted to do or see once inside Website 2 — role-based access control, data permissions, and other business-logic authorization are a separate concern, addressed by Website 2's own application-level design.
+
 ---
 
 ## 2. Website 1 / Gateway / Website 2 Separation
@@ -105,6 +109,14 @@ The private key remains on the device and is never transmitted to Website 1, the
 
 The corresponding public credential is registered with the employee's account.
 
+### Hardware-Backed Key Storage
+
+Where the device supports it, the private key must be generated and stored in a hardware-backed secure store (e.g., TPM, Secure Enclave, or equivalent).
+
+If hardware-backed storage is unavailable, the platform's strongest available secure credential store is used instead, and that device is treated as lower-assurance.
+
+In all cases, the private key still never leaves the device.
+
 Conceptually:
 
 ```text
@@ -155,6 +167,22 @@ The following are considered unauthorized changes:
 - Different device
 - Different browser authorization context
 - Use of the existing session from an unauthorized device
+
+---
+
+## 5A. Administrator Root of Trust
+
+Every admin-gated operation in this document — device registration, recovery, credential revocation, emergency access — assumes a trusted administrator identity already exists. That identity must itself be established through a controlled process, not normal employee self-registration.
+
+The initial administrator account is provisioned through a controlled administrative enrollment process.
+
+This process requires:
+
+- Strong MFA and device binding for the administrator, equivalent to or stronger than employee device binding.
+- Secure provisioning of initial administrator credentials/keys, outside of any self-service flow.
+- A separate, verified process for administrator recovery or replacement — an administrator cannot recover their own access through the same self-service path available to employees.
+
+This administrator identity becomes the root of trust for all admin-gated operations described elsewhere in this document.
 
 ---
 
@@ -257,6 +285,18 @@ During successful rotation:
 The exact credential rotation period will be defined during final implementation.
 
 Credential rotation must not require the private key to leave the device.
+
+### Offline Grace Period
+
+A device that is offline at the time of scheduled rotation is not immediately locked out.
+
+The credential is given a defined grace period after its scheduled rotation date, during which the existing credential remains valid.
+
+Once the device reconnects within the grace period, it must re-attest and complete rotation.
+
+If the grace period expires without re-attestation, the credential becomes invalid and the device requires re-registration or recovery.
+
+The exact grace period length will be defined during final implementation.
 
 ---
 
@@ -692,6 +732,16 @@ It cannot:
 - Modify Website 2 security controls
 
 The administrator must reauthenticate before performing the revocation.
+
+### Out-of-Band Channel Security
+
+The direct Admin → Website 2 channel receives the same level of protection as the Gateway boundary:
+
+- Strong authenticated service-to-service communication.
+- Administrator authentication and authorization on every call.
+- A narrow endpoint that can only revoke sessions — no other capability is exposed.
+- No session creation or authorization is possible through this channel.
+- Every use is fully audited.
 
 ```text
 Gateway unavailable
