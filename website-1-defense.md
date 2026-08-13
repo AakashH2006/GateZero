@@ -103,6 +103,8 @@ Website 2
 
 Website 1 never directly communicates with Website 2 or the Access Gateway.
 
+Connect generates a one-time, short-lived authorization for the Gateway to act on. Website 1 never creates, controls, or holds the resulting Website 2 session — that session exists only between the Gateway and Website 2.
+
 ---
 
 ## 5. Connect-Time Security Check
@@ -162,6 +164,10 @@ Monitor:
 
 The Mini EDR does not perform endpoint monitoring, process monitoring, file monitoring, or general network monitoring.
 
+### Scope Boundary
+
+The Mini EDR monitors Website 1 login, MFA, and Connect activity only. It does not monitor Website 2 activity or Website 2 session telemetry. Website 2 has its own, separately designed **Session Guard** responsible for detecting anomalies within its own session once a connection is established. The two detection layers are independent and do not share responsibility for each other's domain.
+
 ---
 
 ## 7. Risk Levels
@@ -185,7 +191,7 @@ Allow Connect
 Issue 5-minute Gateway authorization
 ```
 
-The resulting authorization is bound to the authenticated Website 1 session and its associated device context.
+The resulting authorization is one-time (single-use) and bound to the authenticated Website 1 session and its associated device context.
 
 ### Medium Risk
 
@@ -266,9 +272,12 @@ The authorization is valid for:
 
 **5 minutes**
 
-The authorization is cryptographically or otherwise securely bound to the authenticated Website 1 session and its associated device/session context.
+The authorization is:
 
-The Gateway must verify this binding before allowing access to Website 2.
+- **One-time.** It is consumed on first use and cannot be replayed for a second connection.
+- **Cryptographically device-bound.** The authorization is bound to the device's public-key credential. The corresponding private key never leaves the device (e.g., hardware-backed key storage), so a copied or intercepted authorization cannot be redeemed from a different device.
+
+The Gateway must verify both the one-time consumption state and the device-key binding before allowing access to Website 2.
 
 The 7-day Website 1 session is therefore never directly used as a Website 2 access credential.
 
@@ -329,6 +338,12 @@ Controls include:
 - Monitoring of repeated Connect attempts
 
 Every Connect attempt is logged, including denied attempts.
+
+Excessive or repeated Connect failures trigger:
+
+1. A temporary cooldown on further Connect attempts for that account/session.
+2. A security log entry recording the failure pattern.
+3. A notification to the employee (e.g., email/push) so they are aware of the activity, independent of any security alert routed to administrators.
 
 ---
 
@@ -477,9 +492,9 @@ An administrative MFA override must not provide permanent Website 2 access.
 
 ---
 
-## 16. Emergency Connect During Website 1 Outage
+## 16. Emergency Connect During Website 1 or Gateway Outage
 
-Website 1 may become temporarily unavailable.
+Website 1 or the Access Gateway may become temporarily unavailable.
 
 An emergency administrative Connect mechanism is provided for this situation.
 
@@ -489,7 +504,7 @@ The emergency Connect function must **only be enabled when Website 1 is independ
 
 Website 1 must never be able to declare itself unavailable or directly trigger the emergency state.
 
-The Authorization Service performs independent health checks against Website 1 and maintains the trusted health state used to determine whether the emergency mechanism may be enabled.
+The Authorization Service performs independent health checks against Website 1 (and the Gateway) and maintains the trusted health state used to determine whether the emergency mechanism may be enabled.
 
 A single failed health check must not immediately open emergency access.
 
@@ -517,6 +532,15 @@ DISABLED                   CONDITIONALLY ENABLED
 An administrator must not have a permanent bypass button that can be used while Website 1 is operating normally.
 
 Once conditionally enabled, an emergency Connect request still requires strong administrator re-authentication and explicit verification of the affected employee's identity before a 5-minute Gateway authorization is issued.
+
+The resulting emergency authorization is:
+
+- **Employee-specific.** Issued for one named employee only, never a generic or shared emergency credential.
+- **Device-bound.** Bound to that employee's device public-key credential, the same as a normal Connect authorization.
+- **One-time.** Consumed on first use, not reusable across connections.
+- **Time-bounded.** Capped at 5 minutes with no extension (see §17).
+
+There is no permanent bypass credential and no reusable emergency token.
 
 ---
 
@@ -639,10 +663,16 @@ The Gateway remains the final enforcement point.
 
 The following are not yet resolved in this design and should be addressed before or during implementation:
 
-- **Attacker-induced outage confirmation.** The emergency Connect path (§16) currently enables on multiple automated failed health checks alone. An attacker able to sustain a denial-of-service against Website 1 could still trip this threshold. Consider requiring a human confirmation step (on-call/second admin) in addition to automated detection before conditionally enabling emergency access.
+- **Attacker-induced outage confirmation.** The emergency Connect path (§16) currently enables on multiple automated failed health checks alone. An attacker able to sustain a denial-of-service against Website 1 (or the Gateway) could still trip this threshold. Consider requiring a human confirmation step (on-call/second admin) in addition to automated detection before conditionally enabling emergency access.
 - **MFA override dual-control.** §15 allows a single administrator to bypass an employee's MFA. Given the sensitivity, consider requiring a second approver or an additional automated policy check before the override takes effect.
-- **Device/session binding mechanism undefined.** The document repeatedly states that Gateway authorizations are bound to a device/session context (§5, §7, §8, §21) but does not specify the mechanism (e.g., TLS client certificate, device fingerprint, bound cookie). This needs to be decided during implementation.
 - **Clock skew / replay tolerance for the 5-minute grant.** Validation of the grant happens across two services (Authorization Service and Gateway). The design should state an explicit clock-sync requirement and skew tolerance so "5 minutes" is enforced consistently.
 - **Log data classification.** Security logs (§11) may contain PII (IP addresses, device fingerprints, employee identity tied to risk events). The design should state retention period, access controls, and classification for the log store itself.
+- **Website 2 Session Guard.** §6 references Website 2's own Session Guard as the detection layer for the W2 side, but it is out of scope for this document and not yet designed. Track separately.
+
+~~Device/session binding mechanism undefined~~ — **Resolved.** §8 now specifies cryptographic, public-key-based device binding with the private key never leaving the device.
 
 These items are lower severity than the core trust model, which is otherwise complete, but should be tracked and closed out before production rollout.
+
+### Status
+
+Per design review, Website 1 is considered **frozen** as of this revision, pending closure of the open items above (which do not block moving forward with implementation).
