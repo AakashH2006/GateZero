@@ -83,6 +83,16 @@ The Gateway authorization is:
 
 The authorization is not a reusable Website 2 credential.
 
+### Authorization Time Validation
+
+Server-side time is authoritative for all authorization and session-expiration decisions.
+
+Client-provided timestamps are not trusted.
+
+A small server-side clock-skew tolerance may be permitted for distributed components.
+
+Expired authorizations remain invalid even if a client reports a different local time.
+
 ---
 
 ## 4. Cryptographic Device Binding
@@ -108,6 +118,16 @@ Authorized Device
 Website 2 can require cryptographic proof that the device possesses the private key associated with the registered credential.
 
 This prevents a stolen session identifier from being sufficient by itself to access Website 2.
+
+### Cryptographic Challenge Freshness
+
+Every cryptographic device-authentication request must use a fresh, unpredictable, server-generated nonce.
+
+The device signs the challenge using its private key.
+
+Website 2 verifies the signature using the registered public credential.
+
+A previously generated signature or proof cannot be reused for another authentication request.
 
 ---
 
@@ -218,6 +238,25 @@ Credential revocation may occur because of:
 - Security response
 
 When a credential is revoked, associated active Website 2 sessions are terminated.
+
+---
+
+## 9A. Device Credential Rotation
+
+Device credentials must not remain valid indefinitely.
+
+The system periodically requires device re-attestation and credential rotation.
+
+During successful rotation:
+
+1. The device proves possession of the current private key.
+2. A new device credential is established.
+3. The new credential becomes active.
+4. The previous credential is revoked.
+
+The exact credential rotation period will be defined during final implementation.
+
+Credential rotation must not require the private key to leave the device.
 
 ---
 
@@ -638,6 +677,36 @@ Normal authorization cannot be completed while the required authorization infras
 
 A controlled administrator emergency path is therefore available.
 
+### Out-of-Band Emergency Session Revocation
+
+If the Gateway is unavailable while an active Website 2 session must be terminated, an administrator may use a separate out-of-band revocation mechanism that communicates directly with Website 2.
+
+The mechanism is restricted to session revocation only.
+
+It cannot:
+
+- Create Website 2 sessions
+- Authorize new devices
+- Bypass MFA
+- Create emergency credentials
+- Modify Website 2 security controls
+
+The administrator must reauthenticate before performing the revocation.
+
+```text
+Gateway unavailable
+        ↓
+Active W2 session requires termination
+        ↓
+Admin reauthenticates
+        ↓
+Out-of-band W2 revocation
+        ↓
+W2 terminates session
+```
+
+The revocation is logged as a high-priority security event.
+
 ---
 
 ## 27. Trusted Outage Detection
@@ -786,6 +855,23 @@ After successful Website 2 session establishment, the emergency authorization is
 
 An expired or previously used emergency authorization is rejected.
 
+### Emergency MFA Override Control
+
+The current architecture uses a single administrator.
+
+Because there is only one administrator, true two-person approval cannot be enforced.
+
+Emergency administrator actions therefore require:
+
+- Strong administrator reauthentication
+- Explicit confirmation
+- A documented reason
+- High-priority audit logging
+- Employee notification
+- Strict emergency-access restrictions
+
+Single-administrator emergency approval is an accepted residual risk of the current architecture.
+
 ---
 
 ## 32. Security Event Boundary
@@ -924,3 +1010,9 @@ The core principle is:
 > Website 1 proves identity. The Gateway authorizes access. Website 2 independently protects the work session.
 
 This minimizes the dependency between Website 1 and Website 2 while maintaining strong controls over authorization, device identity, session security, and emergency access.
+
+---
+
+## 37. Open Items
+
+- **Log data classification, retention, and access control.** Deferred to final implementation/design — not specified in this document.
