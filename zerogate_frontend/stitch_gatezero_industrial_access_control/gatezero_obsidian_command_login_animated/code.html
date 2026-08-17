@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+
+<html class="dark" lang="en"><head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>GATEZERO - Access Control Interface</title>
+<script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&amp;family=IBM+Plex+Mono:wght@500;600&amp;family=IBM+Plex+Sans:wght@400&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&amp;display=swap" rel="stylesheet"/>
+<script id="tailwind-config">
+  tailwind.config = {
+    darkMode: "class",
+    theme: {
+      extend: {
+        "colors": {
+                "on-primary-fixed-variant": "#00530e",
+                "primary-container": "#00ff41",
+                "tertiary-fixed-dim": "#e7bf99",
+                "background": "#0c160a",
+                "on-secondary-container": "#b7b4b4",
+                "on-error-container": "#ffdad6",
+                "on-background": "#dae6d2",
+                "warning-amber": "#FFB000",
+                "alert-red": "#FF003C",
+                "on-tertiary-fixed": "#2c1701",
+                "on-secondary-fixed": "#1c1b1b",
+                "on-surface": "#dae6d2",
+                "surface": "#0c160a",
+                "secondary-fixed-dim": "#c9c6c5",
+                "on-secondary-fixed-variant": "#474646",
+                "on-surface-variant": "#b9ccb2",
+                "surface-dim": "#0c160a",
+                "error-container": "#93000a",
+                "outline-variant": "#3b4b37",
+                "on-secondary": "#313030",
+                "primary": "#ebffe2",
+                "on-error": "#690005",
+                "surface-container": "#182216",
+                "on-tertiary-fixed-variant": "#5d4124",
+                "laser-hairline": "rgba(0, 255, 65, 0.3)",
+                "surface-container-high": "#222d20",
+                "inverse-surface": "#dae6d2",
+                "error": "#ffb4ab",
+                "tertiary-fixed": "#ffdcbd",
+                "tertiary-container": "#ffd5ae",
+                "surface-container-lowest": "#071106",
+                "primary-fixed-dim": "#00e639",
+                "secondary-fixed": "#e5e2e1",
+                "surface-container-highest": "#2d382a",
+                "tertiary": "#fff8f4",
+                "scanline-fill": "rgba(0, 0, 0, 0.2)",
+                "secondary-container": "#474646",
+                "on-primary": "#003907",
+                "surface-variant": "#2d382a",
+                "on-primary-container": "#007117",
+                "surface-tint": "#00e639",
+                "secondary": "#c9c6c5",
+                "inverse-primary": "#006e16",
+                "on-primary-fixed": "#002203",
+                "outline": "#84967e",
+                "primary-fixed": "#72ff70",
+                "on-tertiary": "#442b10",
+                "inverse-on-surface": "#283326",
+                "surface-container-low": "#141e12",
+                "on-tertiary-container": "#7a5b3c",
+                "surface-bright": "#313c2e"
+        },
+        "borderRadius": {
+                "DEFAULT": "0.25rem",
+                "lg": "0.5rem",
+                "xl": "0.75rem",
+                "full": "9999px"
+        },
+        "spacing": {
+                "margin-edge": "24px",
+                "gutter": "16px",
+                "unit": "4px",
+                "panel-gap": "2px"
+        },
+        "fontFamily": {
+                "headline-md": [
+                        "Barlow Condensed"
+                ],
+                "data-main": [
+                        "IBM Plex Mono"
+                ],
+                "data-lg": [
+                        "IBM Plex Mono"
+                ],
+                "display-lg": [
+                        "Barlow Condensed"
+                ],
+                "headline-sm": [
+                        "Barlow Condensed"
+                ],
+                "label-caps": [
+                        "Barlow Condensed"
+                ],
+                "label-sm": [
+                        "Barlow Condensed"
+                ],
+                "data-sm": [
+                        "IBM Plex Mono"
+                ],
+                "data-mono": [
+                        "IBM Plex Mono"
+                ],
+                "body-sm": [
+                        "IBM Plex Mono"
+                ],
+                "status-code": [
+                        "IBM Plex Mono"
+                ],
+                "body-main": [
+                        "IBM Plex Mono"
+                ]
+        },
+        "fontSize": {
+                "headline-md": [
+                        "24px",
+                        {
+                                "lineHeight": "1.2",
+                                "letterSpacing": "0.1em",
+                                "fontWeight": "600"
+                        }
+                ],
+                "data-main": [
+                        "14px",
+                        {
+                                "lineHeight": "20px",
+                                "letterSpacing": "0px",
+                                "fontWeight": "400"
+                        }
+                ],
+                "data-lg": [
+                        "18px",
+                        {
+                                "lineHeight": "24px",
+                                "letterSpacing": "0px",
+                                "fontWeight": "500"
+                        }
+                ],
+                "display-lg": [
+                        "48px",
+                        {
+                                "lineHeight": "1.1",
+                                "letterSpacing": "0.15em",
+                                "fontWeight": "700"
+                        }
+                ],
+                "headline-sm": [
+                        "18px",
+                        {
+                                "lineHeight": "1.2",
+                                "letterSpacing": "0.08em",
+                                "fontWeight": "600"
+                        }
+                ],
+                "label-caps": [
+                        "14px",
+                        {
+                                "lineHeight": "16px",
+                                "letterSpacing": "0.12em",
+                                "fontWeight": "600"
+                        }
+                ],
+                "label-sm": [
+                        "11px",
+                        {
+                                "lineHeight": "12px",
+                                "letterSpacing": "0.15em",
+                                "fontWeight": "600"
+                        }
+                ],
+                "data-sm": [
+                        "12px",
+                        {
+                                "lineHeight": "16px",
+                                "letterSpacing": "0px",
+                                "fontWeight": "400"
+                        }
+                ],
+                "data-mono": [
+                        "14px",
+                        {
+                                "lineHeight": "20px",
+                                "letterSpacing": "0px",
+                                "fontWeight": "500"
+                        }
+                ],
+                "body-sm": [
+                        "14px",
+                        {
+                                "lineHeight": "20px",
+                                "letterSpacing": "0.01em",
+                                "fontWeight": "400"
+                        }
+                ],
+                "status-code": [
+                        "12px",
+                        {
+                                "lineHeight": "16px",
+                                "letterSpacing": "0.02em",
+                                "fontWeight": "600"
+                        }
+                ],
+                "body-main": [
+                        "16px",
+                        {
+                                "lineHeight": "24px",
+                                "letterSpacing": "0.01em",
+                                "fontWeight": "400"
+                        }
+                ]
+        }
+},
+    },
+  }
+</script>
+<style>
+        .line-etched {
+            border-color: #3b4b37;
+            border-width: 1px;
+        }
+        .panel-recessed {
+            background-color: #141e12;
+            box-shadow: inset 0 0 10px rgba(0,0,0,0.5);
+        }
+        .bg-graphite {
+            background-color: #0c160a;
+        }
+        .signal-idle {
+            background-color: #00ff41;
+            color: #0c160a;
+        }
+        .signal-pending {
+            background-color: #FFB000;
+            color: #0c160a;
+        }
+        .signal-granted {
+            background-color: #00ff41;
+            color: #0c160a;
+        }
+        .signal-denied {
+            background-color: #FF003C;
+            color: #0c160a;
+        }
+        .text-signal-idle {
+            color: #00ff41;
+        }
+        .border-signal-idle {
+            border-color: #00ff41;
+        }
+        .material-symbols-outlined {
+            font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        .m-icon-fill {
+            font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+        }
+        
+        /* Grid definitions */
+        .industrial-grid {
+            display: grid;
+            gap: 1px;
+            background-color: #3b4b37;
+            border: 1px solid #3b4b37;
+        }
+        .industrial-grid > * {
+            background-color: #0c160a;
+        }
+
+        /* Scanline Effect */
+        .scanlines {
+            background: linear-gradient(
+                to bottom,
+                rgba(0, 255, 65, 0),
+                rgba(0, 255, 65, 0) 50%,
+                rgba(0, 255, 65, 0.05) 50%,
+                rgba(0, 255, 65, 0.05)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+        }
+        
+        .panel-scanlines {
+            background: linear-gradient(
+                to bottom,
+                rgba(0, 255, 65, 0),
+                rgba(0, 255, 65, 0) 50%,
+                rgba(0, 255, 65, 0.08) 50%,
+                rgba(0, 255, 65, 0.08)
+            );
+            background-size: 100% 4px;
+            pointer-events: none;
+        }
+
+        @keyframes scrollText {
+            0% { transform: translateY(0); }
+            100% { transform: translateY(-50%); }
+        }
+    </style>
+</head>
+<body class="bg-background text-on-surface h-screen w-screen overflow-hidden flex flex-col font-body-main selection:bg-primary-container selection:text-background relative">
+<div class="absolute inset-0 scanlines z-50 mix-blend-screen opacity-50"></div>
+<!-- Background Matrix Text -->
+<div class="fixed inset-0 z-0 overflow-hidden pointer-events-none opacity-[0.08] text-primary-container font-data-mono text-sm leading-snug select-none">
+<div class="w-full h-[200%] flex flex-col animate-[scrollText_40s_linear_infinite]">
+<div class="flex-1 whitespace-pre-wrap break-all p-4">
+            0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 
+        </div>
+<div class="flex-1 whitespace-pre-wrap break-all p-4">
+            0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 0x4F A1-Z9 *** SYNC_ERR 0x00FF 404_NF 892_AC SYS_FAULT 0x1A2B &gt;_ REQ_DENIED 0x77F1 00:FF:AA [ENCRYPTED] 10101010 01101001 0x889A NULL_PTR SECTOR_7G 0x2C4D A9-B2 *** INIT_SEQ 0x00A1 200_OK 773_AC SYS_OP 0x3B4C &gt;_ REQ_ACK 0x88A2 11:EE:BB [DECRYPTED] 11001100 10011001 0x99AB VAL_PTR SECTOR_8H 
+        </div>
+</div>
+</div>
+<!-- Screen 1: Login (Checkpoint Entry) -->
+<div class="flex-1 flex flex-col items-center justify-center h-full w-full absolute inset-0 z-10 transition-opacity duration-300" id="screen-login">
+<div class="industrial-grid p-panel-gap w-full max-w-md mx-auto relative">
+<div class="flex flex-col items-center p-8 text-center panel-recessed relative overflow-hidden bg-background">
+<div class="absolute inset-0 panel-scanlines z-0"></div>
+<div class="absolute top-0 left-0 w-full h-1 bg-surface-variant"></div>
+<div class="mb-8 relative z-10">
+<span class="font-data-mono text-4xl font-bold text-primary-container tracking-tighter">GATEZERO</span>
+</div>
+<div class="w-32 h-32 border border-primary-container/50 rounded-full flex items-center justify-center mb-8 relative shadow-[0_0_15px_rgba(0,255,65,0.3)] z-10">
+<div class="absolute inset-2 border border-primary-container border-dashed rounded-full animate-[spin_20s_linear_infinite] opacity-75"></div>
+<span class="material-symbols-outlined text-4xl text-primary-container m-icon-fill drop-shadow-[0_0_8px_rgba(0,255,65,0.8)]">door_front</span>
+</div>
+<div class="w-full flex flex-col gap-4 relative z-10">
+<button class="w-full h-12 flex items-center justify-center border line-etched bg-graphite hover:bg-surface-container-high transition-colors text-primary-container font-label-caps text-label-caps tracking-widest relative overflow-hidden group" onclick="transitionTo('mfa')">
+<span class="relative z-10">PRESENT CREDENTIALS</span>
+<div class="absolute bottom-0 left-0 w-full h-[2px] bg-primary-container scale-x-0 group-hover:scale-x-100 transition-transform origin-left"></div>
+</button>
+<p class="font-data-mono text-status-code text-primary-container/70 text-left w-full">&gt; INITIATING CONNECTION...<br/>&gt; REDIRECTING TO SECURE AUTH_GATEWAY...</p>
+</div>
+</div>
+</div>
+</div>
+<!-- Screen 2: MFA -->
+<div class="flex-1 flex flex-col items-center justify-center h-full w-full absolute inset-0 z-0 opacity-0 pointer-events-none transition-opacity duration-300" id="screen-mfa">
+<div class="industrial-grid p-panel-gap w-full max-w-md mx-auto">
+<div class="flex flex-col p-6 panel-recessed relative bg-background">
+<div class="absolute inset-0 panel-scanlines z-0"></div>
+<div class="absolute top-0 left-0 w-full h-[2px] bg-tertiary animate-pulse"></div>
+<div class="flex justify-between items-center border-b line-etched pb-4 mb-6 relative z-10">
+<span class="font-label-caps text-label-caps text-on-surface">SECOND FACTOR</span>
+<div class="flex items-center gap-2 text-warning-amber">
+<span class="w-2 h-2 bg-warning-amber animate-pulse"></span>
+<span class="font-status-code text-status-code">T-MINUS 00:45</span>
+</div>
+</div>
+<div class="flex gap-2 justify-center mb-8 relative z-10">
+<div class="w-12 h-16 border line-etched bg-graphite flex items-center justify-center font-data-mono text-xl text-primary-container border-b-2 border-b-primary-container">8</div>
+<div class="w-12 h-16 border line-etched bg-graphite flex items-center justify-center font-data-mono text-xl text-primary-container border-b-2 border-b-primary-container">2</div>
+<div class="w-12 h-16 border line-etched bg-graphite flex items-center justify-center font-data-mono text-xl text-primary-container border-b-2 border-b-outline-variant"></div>
+<div class="w-12 h-16 border line-etched bg-graphite flex items-center justify-center font-data-mono text-xl text-primary-container border-b-2 border-b-outline-variant"></div>
+<div class="w-12 h-16 border line-etched bg-graphite flex items-center justify-center font-data-mono text-xl text-primary-container border-b-2 border-b-outline-variant"></div>
+<div class="w-12 h-16 border line-etched bg-graphite flex items-center justify-center font-data-mono text-xl text-primary-container border-b-2 border-b-outline-variant"></div>
+</div>
+<div class="grid grid-cols-3 gap-1 mb-6 relative z-10">
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">1</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">2</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">3</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">4</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">5</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">6</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">7</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">8</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">9</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container text-on-surface-variant col-start-1" onclick="transitionTo('login')">
+<span class="material-symbols-outlined">close</span>
+</button>
+<button class="h-12 border line-etched bg-graphite hover:bg-surface-container font-data-mono text-on-surface">0</button>
+<button class="h-12 border line-etched bg-primary-container hover:bg-primary-container text-background font-label-caps" onclick="transitionTo('dashboard')">
+<span class="material-symbols-outlined">arrow_forward</span>
+</button>
+</div>
+</div>
+</div>
+</div>
+<!-- Screen 3: Dashboard -->
+<div class="flex-1 flex flex-col h-full w-full absolute inset-0 z-0 opacity-0 pointer-events-none transition-opacity duration-300 bg-surface" id="screen-dashboard">
+<!-- TopAppBar (From JSON) -->
+<header class="fixed top-0 w-full h-16 border-b border-outline-variant bg-surface flex justify-between items-center px-margin-edge z-50">
+<div class="flex items-center gap-4">
+<span class="font-display-lg text-display-lg font-bold text-primary-container tracking-tighter">GATEZERO</span>
+</div>
+<nav class="hidden md:flex items-center h-full">
+<a class="h-full flex items-center px-4 text-primary-container border-b-2 border-primary-container font-label-caps text-label-caps hover:bg-surface-container-high transition-colors" href="#">MONITOR</a>
+<a class="h-full flex items-center px-4 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-container-high transition-colors" href="#">LOGS</a>
+<a class="h-full flex items-center px-4 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-container-high transition-colors" href="#">DIAGNOSTICS</a>
+</nav>
+<div class="flex items-center gap-4 text-primary-container">
+<span class="font-data-mono text-status-code">SESSION: 44:12</span>
+<button class="hover:bg-surface-container-high p-2 rounded transition-colors"><span class="material-symbols-outlined">account_circle</span></button>
+<button class="hover:bg-surface-container-high p-2 rounded transition-colors"><span class="material-symbols-outlined">settings</span></button>
+</div>
+</header>
+<!-- Main Layout with SideNav -->
+<div class="flex flex-1 pt-16">
+<!-- SideNavBar (From JSON) -->
+<nav class="hidden md:flex flex-col h-full border-r border-outline-variant w-64 bg-surface-container flex-shrink-0 z-40">
+<div class="p-4 border-b border-outline-variant flex items-center gap-3">
+<div class="w-10 h-10 bg-surface-variant border line-etched flex items-center justify-center text-primary-container font-status-code text-status-code">OP</div>
+<div>
+<div class="font-label-caps text-label-caps text-on-surface">OP_UNIT_A1</div>
+<div class="font-status-code text-status-code text-on-surface-variant">SECTOR-7G</div>
+</div>
+</div>
+<div class="flex-1 py-4 flex flex-col gap-1">
+<a class="flex items-center gap-3 px-4 py-3 bg-secondary-container text-primary-container border-r-2 border-primary-container font-label-caps text-label-caps" href="#">
+<span class="material-symbols-outlined m-icon-fill">dashboard</span> DASHBOARD
+                    </a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-variant transition-all" href="#">
+<span class="material-symbols-outlined">door_front</span> GATE CONTROL
+                    </a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-variant transition-all" href="#">
+<span class="material-symbols-outlined">group</span> PERSONNEL
+                    </a>
+<a class="flex items-center gap-3 px-4 py-3 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-variant transition-all" href="#">
+<span class="material-symbols-outlined">terminal</span> SYSTEM
+                    </a>
+</div>
+<div class="p-4 border-t border-outline-variant flex flex-col gap-2">
+<button class="w-full py-2 bg-error-container text-on-error border border-error/50 font-label-caps text-label-caps flex items-center justify-center gap-2 hover:bg-error hover:text-on-error-container transition-colors">
+<span class="material-symbols-outlined">warning</span> EMERGENCY_LOCKDOWN
+                    </button>
+<a class="flex items-center gap-3 px-4 py-2 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-variant transition-all" href="#">
+<span class="material-symbols-outlined">help</span> HELP
+                    </a>
+<a class="flex items-center gap-3 px-4 py-2 text-on-surface-variant font-label-caps text-label-caps hover:bg-surface-variant transition-all" href="#" onclick="transitionTo('login')">
+<span class="material-symbols-outlined">logout</span> LOGOUT
+                    </a>
+</div>
+</nav>
+<!-- Dashboard Content -->
+<main class="flex-1 overflow-auto bg-background p-6 relative">
+<div class="absolute inset-0 panel-scanlines z-0"></div>
+<div class="relative z-10">
+<!-- Main Barrier Status Panel -->
+<div class="industrial-grid mb-6">
+<div class="panel-recessed p-6 flex flex-col items-center justify-center min-h-[300px] relative bg-background">
+<div class="absolute top-4 left-4 font-label-caps text-label-caps text-on-surface-variant">BARRIER STATUS</div>
+<div class="absolute top-4 right-4 flex items-center gap-2">
+<span class="w-2 h-2 bg-primary-container"></span>
+<span class="font-status-code text-status-code text-primary-container">IDLE</span>
+</div>
+<div class="w-full max-w-2xl h-16 border-y-2 border-outline-variant flex relative items-center justify-center">
+<!-- Gate visualization -->
+<div class="absolute left-0 w-1/3 h-full border-r-2 border-outline-variant bg-surface-variant/30 flex items-center justify-end pr-2">
+<div class="h-1/2 w-4 bg-outline-variant"></div>
+</div>
+<div class="absolute right-0 w-1/3 h-full border-l-2 border-outline-variant bg-surface-variant/30 flex items-center justify-start pl-2">
+<div class="h-1/2 w-4 bg-outline-variant"></div>
+</div>
+<!-- Central locking mechanism -->
+<div class="w-16 h-20 border-2 border-outline-variant bg-surface z-10 flex flex-col justify-between p-1">
+<div class="w-full h-1 bg-outline-variant"></div>
+<div class="w-full h-1 bg-outline-variant"></div>
+</div>
+</div>
+<div class="mt-8 flex gap-4">
+<button class="px-6 py-2 border line-etched bg-graphite hover:bg-surface-container font-label-caps text-label-caps text-on-surface" onclick="transitionTo('denied')">SIMULATE DENY</button>
+<button class="px-6 py-2 border line-etched bg-graphite hover:bg-surface-container font-label-caps text-label-caps text-on-surface" onclick="transitionTo('empty')">VIEW EMPTY STATE</button>
+</div>
+</div>
+</div>
+<!-- Ticker Log -->
+<div class="industrial-grid">
+<div class="panel-recessed flex flex-col h-64 bg-background">
+<div class="p-2 border-b line-etched font-label-caps text-label-caps text-on-surface-variant bg-surface-container-low flex justify-between">
+<span>ACCESS LOG MANIFEST</span>
+<span class="font-data-mono text-status-code">LAST 24H</span>
+</div>
+<div class="flex-1 overflow-auto p-4 flex flex-col gap-1 font-data-mono text-status-code">
+<div class="flex justify-between items-center text-primary-container py-1 border-b border-outline-variant/30">
+<span>[08:42:11] AUTH_REQ // ID_7739</span>
+<span>GRANTED</span>
+</div>
+<div class="flex justify-between items-center text-primary-container py-1 border-b border-outline-variant/30">
+<span>[08:35:02] SYS_CHECK // AUTO</span>
+<span>OK</span>
+</div>
+<div class="flex justify-between items-center text-error py-1 border-b border-error/30 bg-error-container/20">
+<span>[08:12:44] AUTH_REQ // UNKNOWN</span>
+<span>DENIED - INVALID_TOKEN</span>
+</div>
+<div class="flex justify-between items-center text-primary-container py-1 border-b border-outline-variant/30">
+<span>[07:55:19] AUTH_REQ // ID_2104</span>
+<span>GRANTED</span>
+</div>
+</div>
+</div>
+</div>
+</div>
+</main>
+</div>
+<!-- Footer (From JSON) -->
+<footer class="fixed bottom-0 w-full h-8 flex justify-between items-center px-4 z-40 bg-surface-container-lowest border-t border-outline-variant text-on-surface-variant font-status-code text-status-code">
+<div>© GATEZERO INDUSTRIAL v4.2.0</div>
+<div class="flex gap-4">
+<a class="hover:text-on-surface transition-colors" href="#">PROTOCOL</a>
+<a class="hover:text-on-surface transition-colors" href="#">UPTIME</a>
+<a class="hover:text-on-surface transition-colors" href="#">SECURITY_AUTH</a>
+</div>
+</footer>
+</div>
+<!-- Screen 4: Denied State -->
+<div class="flex-1 flex items-center justify-center h-full w-full absolute inset-0 z-0 opacity-0 pointer-events-none transition-opacity duration-300 bg-background" id="screen-denied">
+<div class="industrial-grid p-panel-gap w-full max-w-lg mx-auto border-error/50 relative">
+<div class="absolute inset-0 panel-scanlines z-0"></div>
+<div class="flex flex-col items-center justify-center p-12 panel-recessed bg-error-container/10 border-t-4 border-error relative z-10">
+<div class="w-full max-w-md h-12 border-y-2 border-error/50 flex relative items-center justify-center mb-12">
+<!-- Closed Gate -->
+<div class="absolute left-0 w-1/2 h-full border-r-4 border-error bg-error/10"></div>
+<div class="absolute right-0 w-1/2 h-full border-l-4 border-error bg-error/10"></div>
+<div class="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 bg-error rounded-full animate-pulse flex items-center justify-center">
+<div class="w-4 h-1 bg-background"></div>
+</div>
+</div>
+<h1 class="font-headline-md text-headline-md text-error tracking-widest uppercase m-0 p-0 text-center">AUTHORIZATION DENIED</h1>
+<!-- Hidden button to reset for demo purposes -->
+<button class="absolute top-2 right-2 text-outline-variant hover:text-on-surface" onclick="transitionTo('dashboard')">
+<span class="material-symbols-outlined text-sm">refresh</span>
+</button>
+</div>
+</div>
+</div>
+<!-- Screen 5: First-time Empty State -->
+<div class="flex-1 flex flex-col h-full w-full absolute inset-0 z-0 opacity-0 pointer-events-none transition-opacity duration-300 bg-background pt-16 pl-0 md:pl-64" id="screen-empty">
+<!-- Re-using header/nav space layout conceptually for the demo -->
+<main class="flex-1 flex flex-col items-center justify-center p-6 relative">
+<div class="absolute inset-0 panel-scanlines z-0"></div>
+<div class="industrial-grid p-panel-gap w-full max-w-2xl relative z-10">
+<div class="panel-recessed p-12 flex flex-col items-center justify-center min-h-[400px] bg-background">
+<div class="w-full max-w-md h-8 border-y border-outline-variant flex relative items-center justify-center mb-8 opacity-50">
+<div class="w-full h-[1px] bg-outline-variant/30"></div>
+<div class="absolute w-8 h-8 border border-outline-variant bg-surface flex items-center justify-center">
+<span class="w-2 h-2 bg-outline-variant"></span>
+</div>
+</div>
+<p class="font-data-mono text-status-code text-on-surface-variant tracking-widest m-0 p-0 text-center">NO RECENT ACTIVITY DETECTED</p>
+<button class="mt-12 px-4 py-2 border line-etched text-on-surface-variant hover:bg-surface-container font-label-caps text-label-caps" onclick="transitionTo('dashboard')">RETURN</button>
+</div>
+</div>
+</main>
+</div>
+<script>
+        function transitionTo(screenId) {
+            // Hide all screens
+            const screens = ['login', 'mfa', 'dashboard', 'denied', 'empty'];
+            screens.forEach(id => {
+                const el = document.getElementById(`screen-${id}`);
+                el.classList.remove('z-10', 'opacity-100', 'pointer-events-auto');
+                el.classList.add('z-0', 'opacity-0', 'pointer-events-none');
+            });
+
+            // Show requested screen
+            const target = document.getElementById(`screen-${screenId}`);
+            if (target) {
+                target.classList.remove('z-0', 'opacity-0', 'pointer-events-none');
+                target.classList.add('z-10', 'opacity-100', 'pointer-events-auto');
+            }
+        }
+    </script>
+</body></html>

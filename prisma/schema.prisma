@@ -1,0 +1,288 @@
+// prisma/schema.prisma
+// GateZero Portal & Operations Desk — Database Schema
+// Supports SQLite (dev) and PostgreSQL (prod) via DATABASE_URL env var
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ─────────────────────────────────────────────
+// Users (populated by mock SSO; no local passwords)
+// ─────────────────────────────────────────────
+model User {
+  id         String   @id @default(cuid())
+  email      String   @unique
+  name       String
+  role       UserRole @default(EMPLOYEE)
+  // External IdP subject identifier (e.g. Okta sub claim)
+  idpSubject String   @unique
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  sessions             Session[]
+  authorizationTokens  AuthorizationToken[]
+  auditLogs            AuditLog[]
+}
+
+enum UserRole {
+  EMPLOYEE
+  ADMIN
+}
+
+// ─────────────────────────────────────────────
+// Server-side sessions (7-day, revocable)
+// ─────────────────────────────────────────────
+model Session {
+  id         String        @id @default(cuid())
+  userId     String
+  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Session state
+  status     SessionStatus @default(PENDING_MFA)
+  // IP address at creation time
+  ipAddress  String
+  // User-Agent fingerprint (hashed)
+  userAgent  String
+  // MFA state tracking
+  mfaToken   String?       // short-lived token tying MFA challenge to this session
+  mfaExpiry  DateTime?
+
+  createdAt  DateTime      @default(now())
+  expiresAt  DateTime      // now + 7 days
+  revokedAt  DateTime?
+
+  authorizationTokens AuthorizationToken[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+enum SessionStatus {
+  PENDING_MFA   // SSO complete, MFA not yet verified
+  ACTIVE        // Fully authenticated
+  REVOKED       // Admin-revoked
+  EXPIRED       // Past expiresAt
+}
+
+// ─────────────────────────────────────────────
+// Authorization Tokens (short-lived, issued by mock Authorization Service)
+// ─────────────────────────────────────────────
+model AuthorizationToken {
+  id        String      @id @default(cuid())
+  userId    String
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessionId String
+  session   Session     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  // Signed JWT payload (stored for revocation lookup; never sent raw to client)
+  tokenHash String      @unique // SHA-256 of the issued token
+  // Device binding
+  ipAddress String
+  userAgent String
+
+  status    AuthzStatus @default(ACTIVE)
+  issuedAt  DateTime    @default(now())
+  expiresAt DateTime    // now + 5 minutes (configurable)
+  revokedAt DateTime?
+
+  @@index([sessionId])
+  @@index([userId])
+  @@index([tokenHash])
+}
+
+enum AuthzStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+// ─────────────────────────────────────────────
+// Single-Use Authorization Exchange Codes (60s TTL)
+// ─────────────────────────────────────────────
+model AuthExchangeCode {
+  id        String   @id @default(cuid())
+  code      String   @unique
+  userId    String
+  sessionId String
+  targetApp String   // e.g. "operations-desk"
+  ipAddress String
+  userAgent String
+  used      Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([code])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────
+// Audit Logs — two streams: LOGIN and CONNECT
+// ─────────────────────────────────────────────
+model AuditLog {
+  id          String       @id @default(cuid())
+  stream      AuditStream
+  eventType   String       // e.g. SSO_INITIATED, SSO_CALLBACK, MFA_APPROVED, CONNECT_GRANTED
+  userId      String?
+  user        User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  sessionId   String?
+  authzId     String?
+  ipAddress   String
+  userAgent   String
+  outcome     String       // SUCCESS | FAILURE | DENIED
+  metadata    String       // JSON blob for extra event-specific data
+  createdAt   DateTime     @default(now())
+
+  @@index([stream])
+  @@index([userId])
+  @@index([createdAt])
+}
+
+enum AuditStream {
+  LOGIN   // SSO, MFA, logout events
+  CONNECT // Connect clicks, authorization events
+}
+
+// ─────────────────────────────────────────────
+// Rate Limit tracking (sliding window, per user+ip)
+// ─────────────────────────────────────────────
+model RateLimitEvent {
+  id        String   @id @default(cuid())
+  key       String   // e.g. "connect:userId:ip"
+  createdAt DateTime @default(now())
+
+  @@index([key, createdAt])
+}
+
+// ═════════════════════════════════════════════
+// WEBSITE 2: THE OPERATIONS DESK MODELS
+// ═════════════════════════════════════════════
+
+// ─────────────────────────────────────────────
+// 1. Assignments Board (Corkboard Pinned Tasks)
+// ─────────────────────────────────────────────
+model Assignment {
+  id            String   @id @default(cuid())
+  title         String
+  description   String
+  department    String   // OPERATIONS | ENGINEERING | LOGISTICS | SUPPORT | FACILITIES | FINANCE
+  status        String   @default("TODO") // TODO | IN_PROGRESS | COMPLETED
+  priority      String   @default("STANDARD") // STANDARD | URGENT
+  assigneeName  String
+  assigneeEmail String
+  deadline      String   // e.g. "1700 HRS" or date
+  rotation      Float    @default(0.0) // random visual tilt (-1.5 to 1.5)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([status])
+  @@index([department])
+}
+
+// ─────────────────────────────────────────────
+// 2. Wire Bulletins (Real-time Operations Feed)
+// ─────────────────────────────────────────────
+model WireBulletin {
+  id        String   @id @default(cuid())
+  timestamp String   // e.g. "0847"
+  category  String   // OPERATIONS | SYSTEM_STATUS | LOGISTICS | ANNOUNCEMENT | FACILITY
+  headline  String
+  body      String
+  urgency   String   @default("NORMAL") // NORMAL | FLASH
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([category])
+}
+
+// ─────────────────────────────────────────────
+// 3. Staff Roster (Company Personnel Directory)
+// ─────────────────────────────────────────────
+model StaffMember {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  role         String
+  department   String
+  status       String   @default("ON_DUTY") // ON_DUTY | REMOTE | ON_CALL | OFF_DUTY
+  deskLocation String
+  extension    String
+  avatarUrl    String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([department])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────
+// 4. Ledger Records (Company Expense / Ledger Sheet)
+// ─────────────────────────────────────────────
+model LedgerRecord {
+  id           String   @id @default(cuid())
+  refNumber    String   @unique // e.g. "REF-8842"
+  entryDate    String   // e.g. "2026-08-16"
+  description  String
+  category     String   // PROCUREMENT | INFRASTRUCTURE | VENDOR_PAYMENT | TRAVEL | SUPPLIES
+  amount       Float
+  type         String   @default("DEBIT") // DEBIT | CREDIT
+  authorizedBy String
+  createdAt    DateTime @default(now())
+
+  @@index([category])
+  @@index([entryDate])
+}
+
+// ─────────────────────────────────────────────
+// 5. Archive Records (Company Documents & Records)
+// ─────────────────────────────────────────────
+model ArchiveRecord {
+  id           String   @id @default(cuid())
+  recordNumber String   @unique // e.g. "REC-0419"
+  title        String
+  department   String
+  filingDate   String   // e.g. "2026-08-10"
+  summary      String
+  tags         String   // comma-separated tags
+  filedBy      String
+  createdAt    DateTime @default(now())
+
+  @@index([department])
+}
+
+// ─────────────────────────────────────────────
+// 6. Desk Messages (Internal Comms Memos)
+// ─────────────────────────────────────────────
+model DeskMessage {
+  id             String   @id @default(cuid())
+  senderName     String
+  senderEmail    String
+  recipientEmail String
+  subject        String
+  content        String
+  urgent         Boolean  @default(false)
+  read           Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  @@index([recipientEmail])
+  @@index([createdAt])
+}
+
+// ─────────────────────────────────────────────
+// 7. Calendar Shifts (Operations & On-Call Schedule)
+// ─────────────────────────────────────────────
+model CalendarShift {
+  id            String   @id @default(cuid())
+  title         String
+  date          String   // e.g. "2026-08-16"
+  startTime     String   // e.g. "0800"
+  endTime       String   // e.g. "1600"
+  shiftType     String   // MORNING_SHIFT | DAY_SHIFT | NIGHT_DESK | ON_CALL | MAINTENANCE_WINDOW
+  assignedStaff String   // comma-separated staff names
+  createdAt     DateTime @default(now())
+
+  @@index([date])
+}
