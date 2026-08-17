@@ -1,0 +1,196 @@
+/* ── Fonts (must precede tailwind import) ─────────────────────────── */
+@import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap');
+
+@import "tailwindcss";
+
+/* ── Custom design tokens ────────────────────────────────────────────────── */
+@theme {
+  /* Obsidian Command color palette */
+  --color-background: #050505;
+  --color-surface: #050505;
+  --color-surface-container: #0a0a0a;
+  --color-surface-container-low: #0a0a0a;
+  --color-surface-container-high: #111111;
+  --color-surface-container-lowest: #000000;
+  --color-surface-container-highest: #1a1a1a;
+  --color-surface-variant: #111111;
+  --color-on-surface: #00ff41;
+  --color-on-surface-variant: #bdc9c6;
+  --color-on-background: #00ff41;
+  --color-primary: #00ff41;
+  --color-primary-container: #0a2a12;
+  --color-on-primary: #000000;
+  --color-on-primary-container: #00ff41;
+  --color-secondary: #c0c7cf;
+  --color-secondary-container: #40484e;
+  --color-on-secondary: #2a3137;
+  --color-tertiary: #ffb59c;
+  --color-error: #ff2a2a;
+  --color-error-container: #93000a;
+  --color-on-error: #690005;
+  --color-on-error-container: #ffdad6;
+  --color-outline: #333333;
+  --color-outline-variant: #1a1a1a;
+  --color-inverse-surface: #d9e4ee;
+  --color-inverse-on-surface: #283239;
+  --color-surface-tint: #00ff41;
+  --color-inverse-primary: #006e16;
+  --color-alert-red: #FF003C;
+  --color-warning-amber: #FFB000;
+
+  /* Fonts */
+  --font-family-data-mono: 'IBM Plex Mono', monospace;
+  --font-family-data-main: 'IBM Plex Mono', monospace;
+  --font-family-data-sm: 'IBM Plex Mono', monospace;
+  --font-family-data-lg: 'IBM Plex Mono', monospace;
+  --font-family-headline-md: 'Barlow Condensed', sans-serif;
+  --font-family-headline-sm: 'Barlow Condensed', sans-serif;
+  --font-family-display-lg: 'Barlow Condensed', sans-serif;
+  --font-family-label-caps: 'Barlow Condensed', sans-serif;
+  --font-family-label-sm: 'Barlow Condensed', sans-serif;
+  --font-family-body-main: 'IBM Plex Mono', monospace;
+  --font-family-body-sm: 'IBM Plex Mono', monospace;
+  --font-family-status-code: 'IBM Plex Mono', monospace;
+}
+
+/* ── Base styles ─────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-background);
+  color: var(--color-on-surface);
+  font-family: 'IBM Plex Mono', monospace;
+  min-height: 100vh;
+}
+
+/* ── Component utilities ─────────────────────────────────────────────────── */
+.line-etched {
+  border-color: #1a1a1a;
+  border-width: 1px;
+}
+
+.panel-recessed {
+  background-color: #0a0a0a;
+  box-shadow: inset 0 0 15px rgba(0, 255, 65, 0.05);
+  position: relative;
+}
+
+.panel-recessed::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(rgba(0, 255, 65, 0.03) 50%, rgba(0, 0, 0, 0.25) 50%);
+  background-size: 100% 4px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.panel-recessed > * {
+  position: relative;
+  z-index: 2;
+}
+
+.bg-graphite {
+  background-color: #050505;
+}
+
+.industrial-grid {
+  display: grid;
+  gap: 1px;
+  background-color: #1a1a1a;
+  border: 1px solid #1a1a1a;
+}
+
+.industrial-grid > * {
+  background-color: #050505;
+}
+
+.scanlines {
+  background: linear-gradient(
+    to bottom,
+    rgba(0, 255, 65, 0),
+    rgba(0, 255, 65, 0) 50%,
+    rgba(0, 255, 65, 0.05) 50%,
+    rgba(0, 255, 65, 0.05)
+  );
+  background-size: 100% 4px;
+  pointer-events: none;
+}
+
+/* ── Material Symbols ──────────────────────────────────────────────────────── */
+.material-symbols-outlined {
+  font-family: 'Material Symbols Outlined';
+  font-weight: normal;
+  font-style: normal;
+  font-size: 24px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}
+
+.m-icon-fill {
+  font-variation-settings: 'FILL' 1, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}
+
+/* ── Barrier animations ──────────────────────────────────────────────────── */
+.barrier-leaf {
+  transition: transform 0.8s cubic-bezier(0.25, 1, 0.5, 1);
+}
+
+.barrier-container.granted .leaf-top {
+  transform: translateY(-100%);
+}
+
+.barrier-container.granted .leaf-bottom {
+  transform: translateY(100%);
+}
+
+.barrier-glow-idle {
+  border-color: #00ff41;
+  box-shadow: 0 0 10px rgba(0, 255, 65, 0.5);
+}
+
+@keyframes pulse-amber {
+  0%, 100% { box-shadow: 0 0 15px #ffb59c; border-color: #ffb59c; }
+  50% { shadow: 0 0 5px #ffb59c; border-color: rgba(255,181,156,0.5); }
+}
+
+@keyframes glow-matrix {
+  0%, 100% { box-shadow: 0 0 20px #00ff41, inset 0 0 10px #00ff41; }
+  50% { box-shadow: 0 0 5px #00ff41, inset 0 0 2px #00ff41; }
+}
+
+.barrier-glow-pending {
+  animation: pulse-amber 1s steps(2, end) infinite;
+}
+
+.barrier-glow-granted {
+  animation: glow-matrix 2s infinite;
+}
+
+/* ── Countdown animation ─────────────────────────────────────────────────── */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.blink { animation: blink 1s step-end infinite; }
+
+/* ── Custom scrollbar ────────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 2px; height: 2px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #00ff41; }
