@@ -105,6 +105,8 @@ Website 1 never directly communicates with Website 2 or the Access Gateway.
 
 Connect generates a one-time, short-lived authorization for the Gateway to act on. Website 1 never creates, controls, or holds the resulting Website 2 session — that session exists only between the Gateway and Website 2.
 
+**Website 1 must never learn or store Website 2's network location, address, or endpoint details.** Only the Authorization Service and Access Gateway resolve where Website 2 lives; Website 1's role ends at requesting an authorization, not at knowing or routing to a destination.
+
 ---
 
 ## 5. Connect-Time Security Check
@@ -125,7 +127,7 @@ Normal changes, such as switching between ordinary networks, should not automati
 
 The system should instead evaluate the overall risk.
 
-The Connect request also establishes the device/session context that will be associated with the resulting Gateway authorization.
+The Connect request also establishes the device/session context that will be associated with the resulting Gateway authorization. Device identification for this purpose relies on cryptographic device identity (§8), not user-agent string fingerprinting — UA strings are trivially spoofed and must not be treated as a reliable identity signal. IP address and other network characteristics are used only as risk telemetry inputs (§6) and never as a substitute for device identity.
 
 ---
 
@@ -163,6 +165,8 @@ Monitor:
 - Whether the request was allowed or denied
 
 The Mini EDR does not perform endpoint monitoring, process monitoring, file monitoring, or general network monitoring.
+
+**Device identity vs. IP address.** Cryptographic device identity (§8) is the authoritative signal for "is this the employee's known device." IP address is treated strictly as telemetry that feeds the risk score (e.g., unexpected geolocation jump) — it is never used on its own to identify or authenticate a device, since IPs are shared, rotated, and spoofable.
 
 ### Scope Boundary
 
@@ -277,7 +281,7 @@ The authorization is:
 - **One-time.** It is consumed on first use and cannot be replayed for a second connection.
 - **Cryptographically device-bound.** The authorization is bound to the device's public-key credential. The corresponding private key never leaves the device (e.g., hardware-backed key storage), so a copied or intercepted authorization cannot be redeemed from a different device.
 
-The Gateway must verify both the one-time consumption state and the device-key binding before allowing access to Website 2.
+The Gateway must verify both the one-time consumption state and the device-key binding before allowing access to Website 2. The Gateway validates the device-bound proof at authorization time but does not need to persist or permanently store the device's public-key credential — validation is scoped to the current authorization, with the Authorization Service remaining the system of record for registered device credentials.
 
 The 7-day Website 1 session is therefore never directly used as a Website 2 access credential.
 
@@ -300,6 +304,10 @@ The employee must click Connect again to obtain another authorization window.
 
 The Gateway enforces the 5-minute expiration independently.
 
+### 8.1 Independent Device Verification at Website 2
+
+As a defense-in-depth measure, Website 2 does not rely solely on the Gateway's assertion that a device is legitimate. Website 2 independently verifies the device's private-key proof itself before treating the resulting session as fully trusted. This means a Gateway compromise that forged or mis-validated a device binding is not sufficient on its own to gain a trusted Website 2 session — Website 2 performs its own cryptographic check of the device credential as a second, independent checkpoint.
+
 ---
 
 ## 9. Website 1 → Authorization Service
@@ -314,6 +322,7 @@ Website 1 must not possess:
 - Authorization Service signing keys
 - Gateway administrative credentials
 - Website 2 credentials
+- Website 2 network location, address, or endpoint information
 
 Authorization Service signing keys must receive equivalent protection to other high-value system keys.
 
@@ -416,6 +425,8 @@ Fresh authentication required
 ```
 
 This ensures that an attacker with a previously stolen 7-day Website 1 session cannot continue using that session after the legitimate employee resets their password.
+
+Password change is additionally treated as a critical security event that propagates beyond Website 1: the Authorization Service notifies the Gateway / Website 2's Session Guard so that any active Website 2 session belonging to the employee is also terminated (see §23.3). Without this propagation, an attacker holding a live Website 2 session could survive a password reset intended to lock them out.
 
 ---
 
@@ -659,7 +670,37 @@ The Gateway remains the final enforcement point.
 
 ---
 
-## 22. Open Items / Follow-Up
+## 22. Device Identity, Cross-System Session Lifecycle, and Recovery
+
+Cryptographic device identity (§8) is the backbone of device trust across the whole chain — Website 1 risk scoring, Gateway authorization, and Website 2's independent verification (§8.1). This section defines how that identity interacts with session lifecycle across systems.
+
+### 22.1 Website 2 Session Independence
+
+Once established, a Website 2 session is managed and monitored by Website 2's own Session Guard (§6 scope boundary). Its ongoing validity does **not** depend on continuous real-time communication with the Gateway or Website 1. The Gateway's role ends at issuing/consuming the one-time authorization that establishes the session; it is not a continuous dependency for the session's survival.
+
+### 22.2 Device Replacement
+
+Registering a new device credential does not, by itself, immediately terminate Website 2 sessions already established from a previously-registered device. Those sessions continue to be governed by Website 2's normal Session Guard rules and expiry — until superseded per §22.3 or ended through normal expiry/logout.
+
+### 22.3 New-Device Login Triggers Old-Session Termination
+
+When an employee successfully authenticates, completes Connect, and establishes a Website 2 session from a newly-registered device, this event terminates prior active Website 2 sessions for that employee. The Authorization Service propagates this as a termination signal to the Gateway/Website 2 Session Guard, closing the window where an old device's session could otherwise persist indefinitely alongside a new one.
+
+### 22.4 Password Change Propagation
+
+As noted in §12, a password change is a critical security event that is propagated beyond Website 1's own session invalidation. The Authorization Service notifies the Gateway/Website 2 Session Guard to terminate any active Website 2 sessions tied to the employee, preventing a stolen Website 2 session from surviving a password reset.
+
+### 22.5 Device Recovery / Replacement Controls
+
+Recovering account access or registering a replacement device credential (e.g., after a lost or stolen device) is itself a security-sensitive operation and must include:
+
+- **Audit logging** of the recovery/replacement event (who, when, method used, outcome).
+- **Employee notification** (e.g., email/push) independent of any administrator-facing alert, so the employee is aware a new device was registered to their account.
+- **Abuse controls**, such as rate limiting, identity re-verification steps, and cooldowns, to prevent an attacker from using the recovery flow to register a rogue device.
+
+---
+
+## 23. Open Items / Follow-Up
 
 The following are not yet resolved in this design and should be addressed before or during implementation:
 
@@ -668,6 +709,8 @@ The following are not yet resolved in this design and should be addressed before
 - **Clock skew / replay tolerance for the 5-minute grant.** Validation of the grant happens across two services (Authorization Service and Gateway). The design should state an explicit clock-sync requirement and skew tolerance so "5 minutes" is enforced consistently.
 - **Log data classification.** Security logs (§11) may contain PII (IP addresses, device fingerprints, employee identity tied to risk events). The design should state retention period, access controls, and classification for the log store itself.
 - **Website 2 Session Guard.** §6 references Website 2's own Session Guard as the detection layer for the W2 side, but it is out of scope for this document and not yet designed. Track separately.
+- **Cross-system propagation channel (§22.3, §22.4).** The exact mechanism/protocol by which the Authorization Service notifies the Gateway/Website 2 Session Guard of termination events (new-device login, password change) is not yet specified and should be defined during implementation.
+- **Device recovery flow detail (§22.5).** The specific identity-reverification steps and rate-limit thresholds for device recovery are not yet defined.
 
 ~~Device/session binding mechanism undefined~~ — **Resolved.** §8 now specifies cryptographic, public-key-based device binding with the private key never leaving the device.
 
