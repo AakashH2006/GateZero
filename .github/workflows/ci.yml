@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: file:./prisma/dev.db
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Type check
+        run: npm run type-check
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: file:./prisma/test.db
+      DEV_MODE: "true"
+      SESSION_SECRET: "ci-test-secret-min-32-chars-xxxxxxxxxxxxxxxx"
+      AUTHZ_SIGNING_SECRET: "ci-authz-secret-min-32-chars-xxxxxxxxxxxx"
+      AUTHZ_TTL_SECONDS: "300"
+      RATE_LIMIT_MAX: "5"
+      RATE_LIMIT_WINDOW_SECONDS: "60"
+      ADMIN_SECRET: "ci-admin-secret"
+      MOCK_IDP_CLIENT_ID: "zerogate-dev-client"
+      MOCK_IDP_CLIENT_SECRET: "mock-client-secret"
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run migrations (test DB)
+        run: npx prisma migrate deploy
+
+      - name: Run tests
+        run: npm test
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/

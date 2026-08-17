@@ -117,3 +117,176 @@ A stolen or leaked Website 1 session is not, by itself, a week of access to Webs
 ## Why it matters
 
 Because Website 1 and Website 2 are never directly linked, an attacker who finds Website 1 still cannot see, scan, or reach Website 2. Even an attacker who fully compromises Website 2 cannot pivot outward — egress restrictions block any path back to the Gateway, Authorization Service, or Website 1. Security effort concentrates on two purpose-built components instead of being spread across the entire sensitive application — while, from the employee's side, it's simply logging in, clicking Connect when needed, and opening Website 2 as usual.
+
+---
+
+## 💻 Implementation
+
+This repository contains the working implementation of the GateZero architecture described above.
+
+### 🏗️ Implementation Architecture
+
+```
+Browser
+  │
+  ▼
+┌─────────────────────────────────────────────┐
+│         Website 1 — GateZero Gateway        │
+│         Next.js 16 + TypeScript + Prisma    │
+│                                             │
+│  /api/auth/*    — SSO + Email MFA           │
+│  /api/authz/*   — Zero-Trust token service  │
+│  /api/connect   — Authorization grant       │
+│  /api/admin/*   — Admin management          │
+│  /api/mock-idp  — Mock IdP (dev only)       │
+│                                             │
+│  Port: 3000                                 │
+└─────────────────────┬───────────────────────┘
+                      │  Exchange Code Handshake
+                      │  (60s TTL, single-use)
+                      ▼
+┌─────────────────────────────────────────────┐
+│     Website 2 — The Operations Desk         │
+│     Standalone Express Server               │
+│                                             │
+│  Per-request live token introspection       │
+│  Zero-Trust: validates every request        │
+│  Neutral 401 Gateway Intercept Screen       │
+│                                             │
+│  Port: 3002 (bound to 127.0.0.1)           │
+└─────────────────────────────────────────────┘
+```
+
+### ✨ Key Features
+
+**Website 1 — GateZero Access Gateway**
+- Employee SSO Login via Mock IdP (PKCE-based OAuth 2.0 flow)
+- Real Email MFA delivery via [Resend](https://resend.com) — 6-digit OTP
+- Anti-Copy-Paste OTP protection on the MFA screen
+- Session Management — 7-day sliding sessions bound to device fingerprint
+- Admin Console — Audit logs, session revocation, token management
+- Sliding-Window Rate Limiting — Protects against brute-force and DoS
+
+**Website 2 — The Operations Desk**
+- Zero-Trust Gating — Every request live-introspects the token against Website 1
+- OIDC-Style Handshake — Single-use exchange code (60s TTL), back-channel server-to-server token exchange
+- Instant Revocation — Token revoked on Website 1 = access cut in real-time on Website 2
+- Device Fingerprint Binding — SHA-256 hashed User-Agent binding prevents stolen token reuse
+- Neutral Intercept Screen — Displays a clean "Gateway Access Required" screen on unauthorized access
+
+**Security Controls Applied**
+- `X-Frame-Options: DENY` — Clickjacking prevention
+- `X-Content-Type-Options: nosniff` — MIME sniffing prevention
+- `Referrer-Policy: strict-origin-when-cross-origin`
+- HTML entity escaping on all dynamic template renders (Stored XSS defense)
+- `encodeURIComponent` on all URL-interpolated record IDs
+
+### 🚀 Quick Start
+
+**Prerequisites:** Node.js 20+, npm 9+
+
+```bash
+# 1. Clone and install
+git clone https://github.com/AakashH2006/GateZero.git
+cd GateZero
+npm install
+
+# 2. Set up environment variables
+cp .env.example .env.local
+# Fill in SESSION_SECRET, AUTHZ_SIGNING_SECRET, and RESEND_API_KEY
+
+# 3. Initialize the database
+npx prisma migrate dev
+
+# 4. Seed demo data
+npm run db:seed
+npm run db:seed-desk
+
+# 5. Start Website 1 (GateZero Gateway)
+npm run dev
+
+# 6. Start Website 2 (The Operations Desk) — in a second terminal
+npm run desk
+```
+
+| Service | URL |
+|:---|:---|
+| GateZero Gateway | http://localhost:3000 |
+| The Operations Desk | http://localhost:3002 |
+
+### 🔄 End-to-End Flow
+
+1. Visit `http://localhost:3000` → Click **[EMPLOYEE SSO SIGN IN]**
+2. Authenticate via the Mock IdP → Complete **Email MFA** (check your inbox)
+3. On the Dashboard, click **`🚀 [LAUNCH THE OPERATIONS DESK :3002] →`**
+4. GateZero issues a 60-second exchange code, Website 2 exchanges it server-to-server for a token, and grants you access
+5. Direct access to `http://localhost:3002` without going through GateZero returns the **Neutral Gateway Intercept Screen**
+
+### 🧪 Automated Regression Tests
+
+```bash
+npm test
+```
+
+**28 / 28 tests passing**
+
+| File | Tests | Coverage |
+|:---|:---:|:---|
+| `__tests__/authz-service.test.ts` | 11 | Token issuance, revocation, session checks, rate limiting, device binding |
+| `__tests__/operations-desk-gate.test.ts` | 7 | Exchange code handshake, live introspection, CRUD operations |
+| `__tests__/security-audit.test.ts` | 10 | Replay attacks, token forgery, MFA bypass, XSS defense |
+
+### ⚙️ Environment Variables
+
+| Variable | Required | Description |
+|:---|:---:|:---|
+| `DATABASE_URL` | ✅ | `file:./prisma/dev.db` for local SQLite |
+| `SESSION_SECRET` | ✅ | Min 32 chars — signs session cookies |
+| `AUTHZ_SIGNING_SECRET` | ✅ | Min 32 chars — signs authorization tokens |
+| `RESEND_API_KEY` | ✅ | Resend API key for real email MFA delivery |
+| `NEXT_PUBLIC_APP_URL` | ✅ | Website 1 URL (`http://localhost:3000`) |
+| `DEV_MODE` | — | `true` enables mock IdP and dev tools |
+| `AUTHZ_TTL_SECONDS` | — | Token lifetime in seconds (default: `300`) |
+| `RATE_LIMIT_MAX` | — | Max requests per window (default: `5`) |
+| `ADMIN_SECRET` | — | Dev-only admin header secret |
+
+### 📁 Project Structure
+
+```
+├── app/
+│   ├── api/
+│   │   ├── auth/          # SSO callback, MFA, logout, session
+│   │   ├── authz/         # Exchange code, token exchange, live verify
+│   │   ├── connect/       # Authorization grant endpoint
+│   │   └── admin/         # Admin: sessions, audit logs, revocation
+│   ├── dashboard/         # Authenticated dashboard with launch button
+│   └── mfa/               # MFA screen with anti-copy-paste protection
+├── lib/
+│   ├── auth/              # SSO config, PKCE, session, email MFA
+│   ├── authz-service/     # Token issuance, exchange codes, introspection
+│   ├── audit.ts           # Structured audit logging
+│   ├── rate-limit.ts      # Sliding-window rate limiter
+│   └── config.ts          # Central environment config
+├── prisma/
+│   ├── schema.prisma      # Full database schema
+│   ├── seed.ts            # Gateway seed data
+│   └── seed-dispatch.ts   # Operations Desk seed data
+├── __tests__/             # Vitest automated regression tests
+├── server-desk.ts         # Website 2 — Standalone Express server
+└── SECURITY-NOTES.md      # Mock vs production documentation
+```
+
+### 🔒 Security Notes
+
+See [SECURITY-NOTES.md](./SECURITY-NOTES.md) for full details on what is mocked vs production-ready.
+
+> **⚠️ Never deploy with `DEV_MODE=true` in production.** This flag:
+> - Activates the Mock IdP (anyone can sign in as any user)
+> - Accepts any 6-digit MFA code
+> - Enables admin access via a static header secret
+
+---
+
+## 📄 License
+
+MIT
