@@ -13,6 +13,7 @@ interface SessionState {
     expiresAt?: string;
     ttlSeconds?: number;
   };
+  csrfToken?: string;
 }
 
 interface AuditEntry {
@@ -105,8 +106,15 @@ export default function DashboardPage() {
     setIsConnecting(true);
     setConnectError(null);
     try {
-      const res = await fetch("/api/connect", { method: "POST" });
+      const res = await fetch("/api/connect", {
+        method: "POST",
+        headers: session?.csrfToken ? { "x-csrf-token": session.csrfToken } : {},
+      });
       const data = await res.json();
+      if (res.status === 403) {
+        setConnectError("SECURITY CHECK FAILED. REFRESH AND TRY AGAIN.");
+        return;
+      }
       if (res.status === 429) {
         setConnectError("RATE LIMIT EXCEEDED. TRY AGAIN LATER.");
         return;

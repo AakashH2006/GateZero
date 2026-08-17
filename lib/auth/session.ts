@@ -70,12 +70,50 @@ export async function createPendingSession(params: {
 }
 
 // ── Activate session after successful MFA ──────────────────────────────────────
+//
+// SECURITY: Session ID rotation.
+// The PENDING_MFA session ID was minted *before* the user proved themselves
+// with a second factor. If that ID was ever captured (log line, proxy,
+// referrer leak, shoulder-surfed QR/link) during the login window, it must
+// not remain valid for the full 7-day lifetime. On successful MFA we retire
+// the pre-MFA session row and issue a brand new ACTIVE session ID, then
+// rewrite the cookie. Anyone holding only the old ID gets a REVOKED session.
 
-export async function activateSession(sessionId: string): Promise<Session> {
-  return prisma.session.update({
-    where: { id: sessionId },
-    data: { status: SessionStatus.ACTIVE, mfaToken: null, mfaExpiry: null },
-  });
+export async function activateSession(params: {
+  sessionId: string;
+  ipAddress: string;
+  userAgent: string;
+}): Promise<Session> {
+  const pending = await prisma.session.findUnique({ where: { id: params.sessionId } });
+  if (!pending) {
+    throw new Error("SESSION_NOT_FOUND");
+  }
+
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS);
+
+  const [, newSession] = await prisma.$transaction([
+    // Retire the pre-MFA session ID — it must never be reusable post-rotation.
+    prisma.session.update({
+      where: { id: pending.id },
+      data: { status: SessionStatus.REVOKED, revokedAt: new Date() },
+    }),
+    // Mint the real, post-MFA 7-day session under a fresh ID.
+    prisma.session.create({
+      data: {
+        userId: pending.userId,
+        status: SessionStatus.ACTIVE,
+        ipAddress: params.ipAddress,
+        userAgent: hashUA(params.userAgent),
+        expiresAt,
+      },
+    }),
+  ]);
+
+  const ironSession = await getIronSessionStore();
+  ironSession.sessionId = newSession.id;
+  await ironSession.save();
+
+  return newSession;
 }
 
 // ── Get and validate the current session from the cookie ──────────────────────

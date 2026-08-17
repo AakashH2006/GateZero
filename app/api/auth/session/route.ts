@@ -9,6 +9,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getValidSession } from "@/lib/auth/session";
 import { getActiveAuthorization } from "@/lib/authz-service";
+import { signCsrfToken } from "@/lib/auth/csrf";
 import { safeHandler } from "@/lib/errors";
 
 export async function GET(_request: NextRequest): Promise<NextResponse> {
@@ -34,6 +35,9 @@ export async function GET(_request: NextRequest): Promise<NextResponse> {
         expiresAt: session.expiresAt,
         createdAt: session.createdAt,
       },
+      // CSRF token for the frontend to echo back on state-changing calls
+      // (e.g. POST /api/connect via the x-csrf-token header).
+      csrfToken: signCsrfToken(session.id),
       authorization: authz
         ? {
             active: true,

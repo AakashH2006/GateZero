@@ -100,16 +100,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         );
       }
 
-      await activateSession(session.id);
+      const activated = await activateSession({
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+      });
 
       void auditLogin({
         eventType: "MFA_TOTP_APPROVED",
         userId: session.userId,
-        sessionId: session.id,
+        sessionId: activated.id,
         ipAddress: ip,
         userAgent: ua,
         outcome: "SUCCESS",
-        metadata: { method: "email" },
+        metadata: { method: "email", rotatedFromSessionId: session.id },
       });
 
       return NextResponse.json({ success: true, redirect: "/dashboard" });
@@ -136,16 +140,20 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         );
       }
 
-      await activateSession(session.id);
+      const activated = await activateSession({
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+      });
 
       void auditLogin({
         eventType: "MFA_TOTP_APPROVED",
         userId: session.userId,
-        sessionId: session.id,
+        sessionId: activated.id,
         ipAddress: ip,
         userAgent: ua,
         outcome: "SUCCESS",
-        metadata: { method: "totp" },
+        metadata: { method: "totp", rotatedFromSessionId: session.id },
       });
 
       return NextResponse.json({ success: true, redirect: "/dashboard" });

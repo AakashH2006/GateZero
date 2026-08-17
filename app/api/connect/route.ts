@@ -22,9 +22,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { getValidSession } from "@/lib/auth/session";
 import { issueAuthorization } from "@/lib/authz-service";
 import { checkRateLimit, connectRateLimitKey } from "@/lib/rate-limit";
+import { CSRF_HEADER, verifyCsrfToken } from "@/lib/auth/csrf";
 import { auditConnect, getClientIP, getClientUA } from "@/lib/audit";
 import {
   unauthorized,
+  forbidden,
   tooManyRequests,
   serverError,
   safeHandler,
@@ -46,6 +48,23 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         metadata: {},
       });
       return unauthorized("Valid session required to connect");
+    }
+
+    // (a.5) CSRF check — Connect is a security-sensitive, state-changing action.
+    // Reject before touching rate limiting or the Authorization Service so a
+    // forged cross-site request never even consumes a rate-limit slot.
+    const csrfToken = request.headers.get(CSRF_HEADER);
+    if (!verifyCsrfToken(session.id, csrfToken)) {
+      void auditConnect({
+        eventType: "CONNECT_DENIED_CSRF",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: {},
+      });
+      return forbidden("Missing or invalid CSRF token");
     }
 
     // (b) Rate limiting — per user + per IP (sliding window)
