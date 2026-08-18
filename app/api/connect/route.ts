@@ -19,11 +19,12 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getValidSession } from "@/lib/auth/session";
-import { issueAuthorization } from "@/lib/authz-service";
+import { getValidSession, flagStepUpRequired, revokeSession, getIronSessionStore } from "@/lib/auth/session";
+import { issueAuthorization, getActiveAuthorization, revokeAuthorization } from "@/lib/authz-service";
 import { checkRateLimit, connectRateLimitKey } from "@/lib/rate-limit";
 import { CSRF_HEADER, verifyCsrfToken } from "@/lib/auth/csrf";
 import { auditConnect, getClientIP, getClientUA } from "@/lib/audit";
+import { assessConnectRisk } from "@/lib/mini-edr";
 import {
   unauthorized,
   forbidden,
@@ -67,6 +68,27 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return forbidden("Missing or invalid CSRF token");
     }
 
+    // (a.6) Mini EDR step-up gate — a prior MEDIUM-risk assessment blocked
+    // Connect until fresh MFA is completed via /api/auth/step-up. The
+    // session itself stays ACTIVE (not revoked); this only gates Connect.
+    // Checked before rate limiting so a gated user doesn't burn rate-limit
+    // slots retrying Connect instead of completing step-up.
+    if (session.connectStepUpRequired) {
+      void auditConnect({
+        eventType: "CONNECT_DENIED_STEP_UP_REQUIRED",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: {},
+      });
+      return forbidden(
+        "Fresh MFA verification required before connecting",
+        "STEP_UP_MFA_REQUIRED"
+      );
+    }
+
     // (b) Rate limiting — per user + per IP (sliding window)
     const rateLimitKey = connectRateLimitKey(session.userId, ip);
     const rateCheck = await checkRateLimit(rateLimitKey);
@@ -82,6 +104,77 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         metadata: { resetAt: rateCheck.resetAt },
       });
       return tooManyRequests(rateCheck.resetAt);
+    }
+
+    // (b.5) Mini EDR — risk assessment (§6-7)
+    const assessment = await assessConnectRisk(session, ip, ua);
+
+    if (assessment.level === "MEDIUM") {
+      // Block Connect and require fresh MFA. The 7-day W1 session is left
+      // untouched — only the Connect endpoint is gated.
+      await flagStepUpRequired(session.id);
+      void auditConnect({
+        eventType: "CONNECT_BLOCKED_MEDIUM_RISK",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: { score: assessment.score, factors: assessment.factors },
+      });
+      return forbidden(
+        "Fresh MFA verification required before connecting",
+        "STEP_UP_MFA_REQUIRED"
+      );
+    }
+
+    if (assessment.level === "HIGH" || assessment.level === "CRITICAL") {
+      // HIGH/CRITICAL terminate the W1 session outright (approved to revoke,
+      // unlike MEDIUM) and, for CRITICAL, also revoke any active
+      // authorization token so Website 2 access is cut immediately.
+      await revokeSession(session.id);
+
+      if (assessment.level === "CRITICAL") {
+        const activeToken = await getActiveAuthorization(session.id);
+        if (activeToken) {
+          await revokeAuthorization(activeToken.tokenId);
+        }
+      }
+
+      const ironSession = await getIronSessionStore();
+      ironSession.destroy();
+      await ironSession.save();
+
+      void auditConnect({
+        eventType:
+          assessment.level === "CRITICAL"
+            ? "CONNECT_BLOCKED_CRITICAL_RISK"
+            : "CONNECT_BLOCKED_HIGH_RISK",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: { score: assessment.score, factors: assessment.factors },
+      });
+
+      // Security alert — implemented as a distinguishable, severity-tagged
+      // audit entry for now. Real external dispatch (email/Slack/pager) is
+      // a named stub, not built in this pass.
+      void auditConnect({
+        eventType: "SECURITY_ALERT",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: { severity: assessment.level, score: assessment.score, factors: assessment.factors },
+      });
+
+      return unauthorized(
+        "Session terminated due to elevated risk — please sign in again",
+        "SESSION_TERMINATED_RISK"
+      );
     }
 
     // (c) Call Authorization Service

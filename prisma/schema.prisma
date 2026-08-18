@@ -51,6 +51,12 @@ model Session {
   mfaToken   String?       // short-lived token tying MFA challenge to this session
   mfaExpiry  DateTime?
 
+  // Mini EDR (§6-7): set when a MEDIUM-risk Connect assessment blocks a
+  // Connect request. Does NOT revoke the session (session stays ACTIVE) —
+  // it only gates the Connect endpoint until the employee completes a
+  // fresh MFA step-up. Cleared by /api/auth/step-up on success.
+  connectStepUpRequired Boolean @default(false)
+
   createdAt  DateTime      @default(now())
   expiresAt  DateTime      // now + 7 days
   revokedAt  DateTime?

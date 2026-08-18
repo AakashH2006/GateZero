@@ -189,3 +189,27 @@ export async function revokeSession(sessionId: string): Promise<void> {
     data: { status: SessionStatus.REVOKED, revokedAt: new Date() },
   });
 }
+
+// ── Mini EDR (§6-7): Connect-scoped step-up gate ───────────────────────────────
+//
+// A MEDIUM risk assessment on Connect must block further Connect attempts and
+// require fresh MFA, but must NOT revoke the 7-day Website 1 session — the
+// employee can keep browsing the portal, they just can't Connect until they
+// step up. This is a narrower gate than session revocation and is
+// intentionally independent of the PENDING_MFA/ACTIVE login state machine.
+
+/** Flag a session as requiring a fresh MFA step-up before Connect will succeed again. */
+export async function flagStepUpRequired(sessionId: string): Promise<void> {
+  await prisma.session.update({
+    where: { id: sessionId },
+    data: { connectStepUpRequired: true },
+  });
+}
+
+/** Clear the step-up gate after the employee completes a fresh MFA challenge. */
+export async function clearStepUpRequired(sessionId: string): Promise<void> {
+  await prisma.session.update({
+    where: { id: sessionId },
+    data: { connectStepUpRequired: false },
+  });
+}
