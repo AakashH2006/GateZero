@@ -1,7 +1,8 @@
 /**
  * End-to-end walk of the real HTTP flow, acting as a browser.
  *
- * Website 1 (:3000) and Website 2 (:3002) must both be running.
+ * Website 1 (:3000), the Gateway (:3001) and Website 2 (:3002) must all be
+ * running.
  * Generates a real ECDSA P-256 key and signs the server's challenges the same
  * way the browser does, so this exercises the actual verification path.
  */
@@ -9,6 +10,7 @@
 import crypto from "crypto";
 
 const W1 = "http://localhost:3000";
+const GW = "http://localhost:3001";
 const W2 = "http://127.0.0.1:3002";
 const UA = "E2E-Runner/1.0";
 
@@ -277,6 +279,36 @@ async function main() {
   const w1Session = await (await go(`${W1}/api/auth/session`)).json();
   check("Website 1 no longer offers the consumed authorization as active",
     w1Session.authorization?.active === false);
+
+  // ── 9b. Gateway hardening (gateway-defense.md §1, §2, §3, §6) ───────────
+  const pk = await (await fetch(`${GW}/grant/public-key`)).json();
+  check("GW §3: the Gateway publishes an ES256 PUBLIC verification key",
+    pk.alg === "ES256" && typeof pk.pem === "string" && !pk.pem.includes("PRIVATE"),
+    `alg=${pk.alg}`);
+
+  const unauthIssue = await fetch(`${GW}/grant/issue`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ sessionId: "x", userId: "y", deviceCredentialId: "z" }),
+  });
+  check("GW §2: an unauthenticated peer cannot ask the Gateway to mint a grant",
+    unauthIssue.status === 403, `status ${unauthIssue.status}`);
+
+  // §6: the Gateway exposes exactly its named routes and nothing else.
+  const surfaces = ["/admin", "/debug", "/metrics", "/api/admin/sessions", "/grant"];
+  const surfaceCodes = [];
+  for (const path of surfaces) {
+    const r = await fetch(`${GW}${path}`);
+    surfaceCodes.push(`${path}=${r.status}`);
+  }
+  check("GW §6: no admin, debug or general-purpose surface on the Gateway",
+    surfaceCodes.every((c) => c.endsWith("=404")), surfaceCodes.join(" "));
+
+  // §1: the browser must never be able to reach Website 2's private address by
+  // asking Website 1 for it — Website 1 holds no such configuration.
+  const w1Env = await (await go(`${W1}/api/auth/session`)).json();
+  check("W1 §4/§9: Website 1's session response leaks no Website 2 address",
+    !JSON.stringify(w1Env).includes("3002"));
 
   // ── 10. §14: a stolen session identifier is not sufficient ───────────────
   //

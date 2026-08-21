@@ -26,7 +26,7 @@ into them.
 | | Responsibility | Never does |
 |---|---|---|
 | **Website 1** — the portal | SSO + MFA, the 7-day session, the Connect action, Mini EDR risk scoring, requesting authorization | Grant access. Learn Website 2's address. Declare itself unavailable. |
-| **Gateway + Authorization Service** | Decide authorization, mint the one-time grant, resolve where Website 2 lives, carry critical events | Store passwords or business data. Become a general API. Monitor Website 2. |
+| **Gateway** (`server-gateway.ts`, :3001) | Decide authorization, mint the ES256-signed one-time grant, resolve where Website 2 lives, relay critical events | Store passwords or business data. Become a general API. Monitor Website 2. Expose any admin or debug surface. |
 | **Website 2** — the Operations Desk | Establish and guard the work session, verify the device itself, enforce its own limits | Trust the Gateway's word about a device. Depend on Website 1 staying up. |
 
 Website 1 is the only permanently public-facing part. Website 2 sits behind the
@@ -236,6 +236,47 @@ a password or token into the log.
 
 ---
 
+## 3A. The Gateway as its own process
+
+`gateway-defense.md` is implemented as a real, separate service on :3001.
+
+**Grants are asymmetrically signed (§3).** The Gateway signs each grant with an
+ES256 private key; Website 2 verifies with the **public** key and holds nothing
+capable of minting one. "The Gateway really did approve this" is now a
+cryptographically checkable claim rather than a shared-secret formality. The
+payload carries the employee, a hash of the device public key, `iat`, `exp`, a
+single-use `jti`, and an audience — so a grant minted for Website 2 is refused
+anywhere else even though its signature is perfectly valid.
+
+The `jti` **is** the authorization record's id, so the signed assertion and the
+row that tracks one-time consumption name the same thing.
+
+**Per-peer credentials (§2).** Each service signs with its own derived key
+instead of one secret everyone shares. A leaked Website 2 credential lets an
+attacker speak as Website 2 — not as Website 1.
+
+**Website 1 cannot mint a grant (§1).** The minting code is not in that process.
+Website 1 asks over an authenticated backend call and the Gateway decides.
+Website 1 also cannot construct the handoff URL — it asks, because it holds no
+configuration naming Website 2's address (W1 §4, §9).
+
+**Nothing else is exposed (§6).** Grant issuance, handoff-URL resolution,
+exchange, redemption, the public key, the event relay, and liveness. Every other
+path is a flat 404. No admin surface, no debug endpoint, no general API.
+
+### Where this design was not followed, and why
+
+**No circuit breaker toward Website 2**, despite §7 asking for one. The Gateway
+makes *zero* outbound calls to Website 2 — the event relay is pull-only and the
+handoff is a URL handed to the browser. There is nothing to break. The pull model
+already provides what §7 wants, structurally. A breaker here would be dead code
+that reads like a safeguard while guarding nothing, which is worse than an
+acknowledged absence because it invites the assumption that the risk is handled.
+`server-gateway.ts` carries a note to add one the moment an outbound path
+appears.
+
+---
+
 ## 4. Session model — three independent clocks
 
 | Clock | Length | Reset by |
@@ -299,10 +340,14 @@ npm install
 npx prisma migrate deploy      # or: npm run db:migrate
 npm run db:seed                # provisions the demo employee AND the admin identity
 
-npm run dev                    # Website 1 + Authorization Service + Gateway  :3000
+npm run dev                    # Website 1, the public portal                 :3000
+npm run gateway                # The Access Gateway                           :3001
 npm run desk                   # Website 2, The Operations Desk               :3002
 npm run health-monitor         # independent outage detection — separate by design
 ```
+
+Four processes, and the separation is the point: Website 1 has no code that
+mints a grant, and the Gateway has no browser-facing surface.
 
 The health monitor is a **separate process on purpose** (see §16 above). Without
 it, health state is never written — which fails safe: an absent record is treated
@@ -316,8 +361,8 @@ registrations that would otherwise need an administrator. It requires
 
 ```bash
 npm run type-check
-npm test        # 148 tests, 10 files
-npm run e2e     # 28 checks against both running servers, with a real EC key
+npm test        # 163 tests, 11 files
+npm run e2e     # 32 checks across all three servers, with a real EC key
 ```
 
 `npm run e2e` is the meaningful one — it drives real HTTP through the entire
@@ -339,7 +384,9 @@ identifier no longer resolves.
 | MFA | fully mocked — `DEV_MODE` accepts any 6-digit code; **production path returns "not configured"** | Duo / Okta Verify / TOTP with vault-stored secrets |
 | Device key storage | real crypto, software-protected | WebAuthn platform authenticator with attestation |
 | Service-to-service auth | shared HMAC secret | mTLS with per-peer keys |
-| Gateway | in-process module | Reverse proxy / auth sidecar, separate host |
+| Gateway | own process, same host and database | Separate host, network-isolated by firewall, own datastore |
+| Gateway peer auth | HMAC, per-peer derived keys | mTLS with pinned, short-lived CA certificates |
+| Grant signing key | derived from a seed in-process | HSM / KMS handle |
 | Health monitor | separate process, **same database** | Separate infrastructure the app cannot write to |
 | Signing keys | env vars | HSM / secrets manager |
 | Audit sink | hash chain in the app DB | Append-only external store, anchored chain head |
@@ -410,6 +457,7 @@ Choices that are deliberate and would look like bugs otherwise:
 |---|---|
 | `website-1-defense.md` | Authoritative design — portal, Connect, Mini EDR, admin, emergency |
 | `website-2-defense.md` | Authoritative design — Session Guard, device lifecycle, events |
+| `gateway-defense.md` | Authoritative design — Gateway hardening and blast radius |
 | `SECURITY-NOTES.md` | Mock vs real, per component, with a §-by-§ implementation map |
 | `threat-model.md` | Threat analysis |
 | `security-controls.md` | Threat-to-control mapping |

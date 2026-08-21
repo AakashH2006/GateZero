@@ -61,6 +61,11 @@ import {
 import { notifyEmployeeById } from "./lib/notify";
 import { deskSessionLimits, ORG_MODE, DESK_DEVICE_REVERIFY_MS } from "./lib/config";
 import { consumeStepUp } from "./lib/admin-stepup";
+import {
+  verifyGrant,
+  grantMatchesDevice,
+  type GrantClaims,
+} from "./lib/gateway/grant";
 
 const app = express();
 const PORT = 3002;
@@ -70,7 +75,7 @@ const HOST = process.env.HOST || "127.0.0.1";
  * The Gateway's address. Website 2 talks to the Gateway; it never talks to
  * Website 1 directly (§2, §35).
  */
-const GATEWAY_URL = process.env.GATEWAY_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+const GATEWAY_URL = process.env.GATEWAY_URL || "http://localhost:3001";
 
 const SESSION_COOKIE = "desk_session";
 const HANDSHAKE_COOKIE = "desk_handshake";
@@ -181,7 +186,14 @@ async function getFromGateway<T>(path: string): Promise<T | null> {
 // two minutes whether or not the device answers the challenge.
 
 interface PendingHandshake {
-  tokenId: string;
+  /**
+   * The Gateway's ES256-signed grant (GW §3). Website 2 verifies this with the
+   * Gateway's PUBLIC key — it holds no secret capable of minting one, so a
+   * valid signature is real evidence the Gateway approved, not merely evidence
+   * that someone knew a shared secret.
+   */
+  grantToken: string;
+  claims: GrantClaims;
   userId: string;
   deviceCredentialId: string;
   /** Public key as delivered by the Gateway, cross-checked at verification. */
@@ -327,26 +339,54 @@ app.get("/api/auth/callback", async (req: Request, res: Response) => {
   try {
     const exchange = await callGateway<{
       success: boolean;
-      tokenId: string;
+      grantToken: string;
       emergency: boolean;
       device: { credentialId: string; publicKeySpki: string; algorithm: string };
       user: { id: string; name: string; email: string; role: string };
-    }>("/api/authz/exchange", { code });
+    }>("/grant/exchange", { code });
 
-    if (!exchange.ok || !exchange.data?.success || !exchange.data.tokenId) {
+    if (!exchange.ok || !exchange.data?.success || !exchange.data.grantToken) {
       deskLog("HANDSHAKE_FAILED", { stage: "exchange", status: exchange.status });
       res.status(401).send(renderNeutralInterceptScreen("GATEWAY_AUTHORIZATION_REQUIRED"));
       return;
     }
 
-    const { tokenId, device, user, emergency } = exchange.data;
+    const { grantToken, device, user, emergency } = exchange.data;
+
+    // GW §3: verify the Gateway's signature with its PUBLIC key. Website 2
+    // holds nothing capable of minting a grant, so this is a real check rather
+    // than a shared-secret formality. The audience binding means a grant minted
+    // for anywhere else is refused here even if its signature is valid.
+    const verified = await verifyGrant(grantToken, "operations-desk");
+    if (!verified.valid || !verified.claims) {
+      deskLog("HANDSHAKE_FAILED", { stage: "grant-verify", reason: verified.reason });
+      res.status(401).send(renderNeutralInterceptScreen("GATEWAY_AUTHORIZATION_REQUIRED"));
+      return;
+    }
+
+    // The grant names the device it was minted for. Cross-check it against the
+    // key the Gateway reported, so a Gateway that mis-reported the binding is
+    // caught here rather than trusted (W1 §8.1).
+    if (
+      !grantMatchesDevice(verified.claims, device.publicKeySpki) ||
+      verified.claims.deviceCredentialId !== device.credentialId ||
+      verified.claims.employeeId !== user.id
+    ) {
+      deskLog("DEVICE_MISMATCH", {
+        userId: user.id,
+        reason: "GRANT_CLAIMS_DISAGREE_WITH_GATEWAY_RESPONSE",
+      });
+      res.status(401).send(renderNeutralInterceptScreen("GATEWAY_AUTHORIZATION_REQUIRED"));
+      return;
+    }
 
     // The authorization is NOT consumed yet. Website 2 must first satisfy
     // itself about the device (§8.1); consuming here would burn the employee's
     // grant on a handshake that has not produced a session.
     const handshakeId = randomId();
     putHandshake(handshakeId, {
-      tokenId,
+      grantToken,
+      claims: verified.claims,
       userId: user.id,
       deviceCredentialId: device.credentialId,
       publicKeySpki: device.publicKeySpki,
@@ -566,9 +606,13 @@ app.post("/api/auth/device-proof", async (req: Request, res: Response) => {
   }
 
   // ── Step 2: spend the one-time authorization (§3 step 9, §24) ───────────
-  const redeem = await callGateway<{ success: boolean }>("/api/authz/redeem", {
-    tokenId: handshake.tokenId,
-    deviceCredentialId: handshake.deviceCredentialId,
+  //
+  // The signed grant is presented back to the Gateway along with the device key
+  // it must be bound to. The Gateway re-verifies both before consuming, so a
+  // grant cannot be spent against a device it was not minted for.
+  const redeem = await callGateway<{ success: boolean }>("/grant/redeem", {
+    grantToken: handshake.grantToken,
+    devicePublicKeySpki: proof.credential.publicKeySpki,
   });
 
   if (!redeem.ok || !redeem.data?.success) {
@@ -584,7 +628,9 @@ app.post("/api/auth/device-proof", async (req: Request, res: Response) => {
   const { session, replacedSessionIds } = await establishDeskSession({
     userId: handshake.userId,
     deviceCredentialId: handshake.deviceCredentialId,
-    authzTokenId: handshake.tokenId,
+    // The grant's jti IS the authorization record id — the signed assertion and
+    // the row tracking one-time consumption name the same thing (GW §3, §6).
+    authzTokenId: handshake.claims.jti,
     ipAddress: req.ip || "unknown",
   });
 
@@ -803,7 +849,7 @@ async function applyCriticalEvent(event: DeliverableEvent): Promise<string> {
 
 async function pollSecurityEvents(): Promise<void> {
   try {
-    const result = await getFromGateway<{ events: DeliverableEvent[] }>("/api/events");
+    const result = await getFromGateway<{ events: DeliverableEvent[] }>("/events");
     if (!result?.events?.length) return;
 
     const acknowledged: string[] = [];
@@ -832,7 +878,7 @@ async function pollSecurityEvents(): Promise<void> {
     }
 
     if (acknowledged.length > 0) {
-      await callGateway("/api/events", { eventIds: acknowledged });
+      await callGateway("/events/ack", { eventIds: acknowledged });
     }
   } catch (err) {
     // The Gateway being unreachable is not a reason to touch existing sessions
@@ -862,7 +908,7 @@ async function reconcileActiveSessions(): Promise<void> {
     for (const { userId } of active) {
       const state = await getFromGateway<{
         state: { accessRevoked: boolean; activeCredentialIds: string[] };
-      }>(`/api/events?reconcile=${encodeURIComponent(userId)}`);
+      }>(`/events?reconcile=${encodeURIComponent(userId)}`);
 
       if (!state?.state) continue;
 

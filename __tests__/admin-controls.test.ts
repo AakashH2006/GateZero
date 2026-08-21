@@ -283,6 +283,12 @@ describe("Trusted outage detection (§16, §27)", () => {
   it("a component with no health record is treated as healthy, not as an outage", async () => {
     // Defaulting the other way would leave emergency access open on a fresh
     // install, before the monitor has ever run.
+    //
+    // The precondition is "no record", so clear it explicitly rather than
+    // assuming the seeded database has none — a real monitor run leaves rows
+    // behind, and a test that depends on ambient state is not a test.
+    await resetHealth("gateway");
+
     const eligibility = await checkEmergencyEligibility("gateway");
     expect(eligibility.eligible).toBe(false);
     expect(eligibility.state).toBe("HEALTHY");

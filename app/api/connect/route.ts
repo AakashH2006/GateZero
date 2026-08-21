@@ -36,11 +36,8 @@ import {
   connectCooldownRemainingMs,
   bindSessionDevice,
 } from "@/lib/auth/session";
-import {
-  issueAuthorization,
-  getActiveAuthorization,
-  revokeAuthorization,
-} from "@/lib/authz-service";
+import { getActiveAuthorization, revokeAuthorization } from "@/lib/authz-service";
+import { issueGrant } from "@/lib/gateway/client";
 import { checkRateLimit, connectRateLimitKey } from "@/lib/rate-limit";
 import { CSRF_HEADER, verifyCsrfToken } from "@/lib/auth/csrf";
 import { auditConnect, getClientIP, getClientUA } from "@/lib/audit";
@@ -370,20 +367,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     // ── 8. Fresh 5-minute, one-time, device-bound authorization (§8) ────────
-    let authResult: Awaited<ReturnType<typeof issueAuthorization>>;
-    try {
-      authResult = await issueAuthorization({
-        sessionId: session.id,
-        userId: session.userId,
-        ipAddress: ip,
-        userAgent: ua,
-        deviceCredentialId: proofResult.credential.id,
-        bindingNonce: parsed.data.nonce,
-        targetApp: "operations-desk",
-      });
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
+    //
+    // Website 1 asks; the Gateway decides and mints. There is deliberately no
+    // code path here that produces a grant (gateway-defense.md §1) — a
+    // compromised portal cannot mint one because the minting code lives in
+    // another process.
+    const issued = await issueGrant({
+      sessionId: session.id,
+      userId: session.userId,
+      ipAddress: ip,
+      userAgent: ua,
+      deviceCredentialId: proofResult.credential.id,
+      bindingNonce: parsed.data.nonce,
+      targetApp: "operations-desk",
+    });
 
+    if (!issued.ok) {
       void auditConnect({
         eventType: "CONNECT_AUTHZ_DENIED",
         userId: session.userId,
@@ -392,20 +391,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         userAgent: ua,
         outcome: "DENIED",
         severity: "WARNING",
-        metadata: { reason: errMsg },
+        metadata: { reason: issued.reason },
       });
       await escalateFailures({ session, ip, ua });
 
-      if (errMsg === "SESSION_INVALID") {
+      if (issued.reason === "SESSION_INVALID") {
         return unauthorized("Session is no longer valid");
       }
-      if (errMsg === "ACCESS_REVOKED") {
+      if (issued.reason === "ACCESS_REVOKED") {
         return forbidden("Access has been revoked", "ACCESS_REVOKED");
       }
-      // §19: fail closed. The Authorization Service being unreachable or
+      // §19 / GW §5: fail closed. A Gateway that is unreachable, slow, or
       // erroring denies Connect — it never implies authorization.
-      return serverError("Authorization service error", err);
+      return serverError("Authorization service error", issued.reason);
     }
+
+    const authResult = issued.grant;
 
     await bindSessionDevice(session.id, proofResult.credential.id);
 

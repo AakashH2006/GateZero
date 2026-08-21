@@ -4,6 +4,8 @@
  * All env access goes through this module — never read process.env directly elsewhere.
  */
 
+import crypto from "crypto";
+
 function requireEnv(key: string): string {
   const value = process.env[key];
   if (!value) {
@@ -127,14 +129,42 @@ export const CLOCK_SKEW_TOLERANCE_MS = parseInt(
   10
 ) * 1000;
 
-// ── Service-to-service authentication (W2 §25, §26, §32) ──────────────────────
-// Shared secret backing the HMAC on Gateway↔Website 2 calls and on critical
-// security events. In production this is replaced by mTLS between services.
+// ── Service-to-service authentication (W2 §25, §26, §32 / GW §2) ──────────────
+//
+// Root secret. Kept for the event-signing HMAC, which is a producer/consumer
+// MAC rather than a peer-authentication credential.
 export const SERVICE_SHARED_SECRET = optionalEnv(
   "SERVICE_SHARED_SECRET",
   AUTHZ_SIGNING_SECRET
 );
 export const SERVICE_AUTH_MAX_SKEW_MS = 60 * 1000;
+
+/**
+ * gateway-defense.md §2: per-peer credentials, not one shared secret.
+ *
+ * With a single secret, every holder can impersonate every other service — a
+ * leaked Website 2 credential would let an attacker speak as Website 1. Each
+ * peer therefore gets its own key, derived from the root secret so a dev
+ * environment needs no extra configuration, and overridable per peer so
+ * production can supply independently-managed material.
+ *
+ * Derivation is HKDF-style: a leaked per-peer key does not reveal the root and
+ * cannot be used to derive any other peer's key.
+ *
+ * This is still a stand-in for mTLS with per-peer certificates. What it buys
+ * over the previous design is key separation — the property that actually
+ * limits blast radius. What it does not buy is CA-backed identity, short-lived
+ * credentials, or automated rotation (§2), which are deployment concerns.
+ */
+export function servicePeerKey(peer: string): string {
+  const override = process.env[`SERVICE_KEY_${peer.toUpperCase().replace(/-/g, "_")}`];
+  if (override) return override;
+
+  return crypto
+    .createHmac("sha256", SERVICE_SHARED_SECRET)
+    .update(`gatezero:service-peer:v1:${peer}`)
+    .digest("hex");
+}
 
 // ── Administrative controls (W1 §14-§17) ──────────────────────────────────────
 // A step-up grant authorizes ONE privileged action and then expires.
@@ -161,6 +191,19 @@ export const HEALTH_PROBE_INTERVAL_MS =
 // they must confirm again.
 export const HEALTH_HUMAN_CONFIRM_TTL_MS =
   parseInt(optionalEnv("HEALTH_HUMAN_CONFIRM_MINUTES", "15"), 10) * 60 * 1000;
+
+// ── Gateway grant signing (gateway-defense.md §3, §4) ─────────────────────────
+// Seed for the DEV-ONLY deterministic derivation of the Gateway's ES256
+// grant-signing key. Production replaces the derivation entirely with an
+// HSM/KMS handle; see lib/gateway/grant.ts loadKeys().
+export const GATEWAY_GRANT_KEY_SEED = optionalEnv(
+  "GATEWAY_GRANT_KEY_SEED",
+  AUTHZ_SIGNING_SECRET
+);
+
+// Where Website 1 and Website 2 reach the Gateway process (§1).
+export const GATEWAY_URL = optionalEnv("GATEWAY_URL", "http://localhost:3001");
+export const GATEWAY_PORT = parseInt(optionalEnv("GATEWAY_PORT", "3001"), 10);
 
 // ── Website 2 location (W1 §4, §9) ────────────────────────────────────────────
 // Deliberately NOT exported to Website 1's request path: W1 must never learn

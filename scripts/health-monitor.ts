@@ -44,15 +44,17 @@ import {
   HEALTH_FAILURE_THRESHOLD,
   HEALTH_MIN_OUTAGE_MS,
   APP_URL,
+  GATEWAY_URL,
 } from "../lib/config";
 
 const TARGETS: { component: ComponentName; url: string }[] = [
   { component: "website-1", url: `${APP_URL}/api/health` },
   {
     component: "gateway",
-    // The Gateway is co-located with Website 1 in this mock; in production it
-    // is a separate host with its own probe endpoint.
-    url: `${process.env.GATEWAY_HEALTH_URL ?? `${APP_URL}/api/health`}`,
+    // The Gateway is its own process (gateway-defense.md §1) with its own
+    // liveness endpoint, so this is a genuinely independent probe rather than
+    // Website 1 answering for it.
+    url: `${process.env.GATEWAY_HEALTH_URL ?? `${GATEWAY_URL}/health`}`,
   },
 ];
 

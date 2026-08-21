@@ -22,17 +22,24 @@
  * swapped under a valid signature; binding the timestamp bounds the replay
  * window to `SERVICE_AUTH_MAX_SKEW_MS`.
  *
+ * PER-PEER KEYS (gateway-defense.md §2)
+ * ─────────────────────────────────────
+ * Each peer signs with its own derived key rather than one secret shared by
+ * everyone. That is the property that limits blast radius: a leaked Website 2
+ * credential lets an attacker speak as Website 2, not as Website 1.
+ *
  * PRODUCTION NOTE
  * ───────────────
- * The spec calls for a mutually authenticated channel (mTLS). A shared HMAC
- * secret gives message authentication but not the per-peer key separation of
- * real mutual TLS: any holder of the secret can impersonate any service. This
- * is the mock-appropriate stand-in, and the header shape survives the swap —
- * under mTLS the peer certificate replaces `X-Service-Id`.
+ * The target is mTLS with per-peer certificates from an internal CA, pinned by
+ * fingerprint, short-lived and automatically rotated (§2). This HMAC scheme is
+ * the stand-in: it has the key separation but not CA-backed identity, expiry,
+ * or rotation. The header shape survives the swap — under mTLS the peer
+ * certificate replaces `X-Service-Id`, and `verifyServiceRequest` becomes a
+ * check on the verified peer identity instead of a MAC.
  */
 
 import crypto from "crypto";
-import { SERVICE_SHARED_SECRET, SERVICE_AUTH_MAX_SKEW_MS } from "./config";
+import { servicePeerKey, SERVICE_AUTH_MAX_SKEW_MS } from "./config";
 
 export const SERVICE_HEADERS = {
   id: "x-service-id",
@@ -41,7 +48,12 @@ export const SERVICE_HEADERS = {
   auth: "x-service-auth",
 } as const;
 
-export type ServiceId = "gateway" | "operations-desk" | "admin-oob" | "health-monitor";
+export type ServiceId =
+  | "website-1"
+  | "gateway"
+  | "operations-desk"
+  | "admin-oob"
+  | "health-monitor";
 
 function bodyDigest(body: string): string {
   return crypto.createHash("sha256").update(body ?? "", "utf8").digest("hex");
@@ -62,7 +74,13 @@ function computeSignature(params: {
     bodyDigest(params.body),
   ].join("\n");
 
-  return crypto.createHmac("sha256", SERVICE_SHARED_SECRET).update(canonical).digest("hex");
+  // §2: keyed with the CALLER's own key, not a secret everyone shares. A peer
+  // can only ever sign as itself, so a leaked credential impersonates one
+  // service rather than all of them.
+  return crypto
+    .createHmac("sha256", servicePeerKey(params.serviceId))
+    .update(canonical)
+    .digest("hex");
 }
 
 /** Build the headers for an outbound service call. */

@@ -17,7 +17,8 @@
     "db:seed-desk": "tsx --env-file=.env.local prisma/seed-dispatch.ts",
     "db:studio": "prisma studio",
     "health-monitor": "tsx --env-file=.env.local scripts/health-monitor.ts",
-    "e2e": "node scripts/e2e-flow.mjs"
+    "e2e": "node scripts/e2e-flow.mjs",
+    "gateway": "tsx --env-file=.env.local server-gateway.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

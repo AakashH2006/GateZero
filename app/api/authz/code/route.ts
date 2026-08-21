@@ -28,7 +28,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { getValidSession } from "@/lib/auth/session";
 import { issueExchangeCode, getActiveAuthorization } from "@/lib/authz-service";
-import { buildHandoffUrl } from "@/lib/gateway";
+import { resolveHandoffUrl } from "@/lib/gateway/client";
 import { CSRF_HEADER, verifyCsrfToken } from "@/lib/auth/csrf";
 import { auditConnect, getClientIP, getClientUA } from "@/lib/audit";
 import {
@@ -90,9 +90,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       targetApp: parsed.data.targetApp,
     });
 
-    // Unknown targets are refused rather than echoed, so this cannot be turned
-    // into an open redirector by naming an arbitrary destination.
-    const targetUrl = buildHandoffUrl(parsed.data.targetApp, code);
+    // Website 1 does not know where Website 2 lives (W1 §4, §9) — it asks the
+    // Gateway, which is the only component that resolves the address (GW §8).
+    // An unknown target is refused there rather than echoed back, so this
+    // cannot be turned into an open redirector.
+    const targetUrl = await resolveHandoffUrl({
+      targetApp: parsed.data.targetApp,
+      code,
+    });
     if (!targetUrl) {
       return badRequest("Unknown target application", "UNKNOWN_TARGET_APP");
     }

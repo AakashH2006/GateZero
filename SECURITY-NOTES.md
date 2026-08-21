@@ -404,11 +404,16 @@ have safe defaults; none is required for local development.
 | `CLOCK_SKEW_TOLERANCE_SECONDS` | `30` | Agreed skew between the components enforcing the 5-minute grant |
 | `SERVICE_SHARED_SECRET` | `AUTHZ_SIGNING_SECRET` | HMAC key for service-to-service calls and event signing |
 | `OPERATIONS_DESK_URL` | `http://localhost:3002` | Where the Gateway resolves Website 2 |
+| `GATEWAY_URL` | `http://localhost:3001` | Where Website 1 and Website 2 reach the Gateway process |
+| `GATEWAY_PORT` | `3001` | Port the Gateway process listens on |
+| `GATEWAY_GRANT_KEY_SEED` | `AUTHZ_SIGNING_SECRET` | **Dev only.** Seeds the deterministic ES256 grant-signing key. Production replaces the derivation with an HSM/KMS handle (GW §4) |
+| `SERVICE_KEY_<PEER>` | derived | Per-peer service credential override, e.g. `SERVICE_KEY_WEBSITE_1` (GW §2) |
 
 ### Running the full system
 
 ```
-npm run dev             # Website 1 + Authorization Service + Gateway (:3000)
+npm run dev             # Website 1, the public portal (:3000)
+npm run gateway         # The Access Gateway (:3001)
 npm run desk            # Website 2, The Operations Desk (:3002)
 npm run health-monitor  # Independent outage detection (required for §16)
 ```
