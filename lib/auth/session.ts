@@ -20,7 +20,12 @@
 import { getIronSession, IronSession } from "iron-session";
 import { cookies } from "next/headers";
 import { prisma } from "../db";
-import { IRON_SESSION_OPTIONS, SESSION_TTL_MS } from "../config";
+import {
+  IRON_SESSION_OPTIONS,
+  SESSION_TTL_MS,
+  MFA_OVERRIDE_SESSION_TTL_MS,
+  CONNECT_COOLDOWN_SECONDS,
+} from "../config";
 import { SessionStatus, User, Session } from "@prisma/client";
 import crypto from "crypto";
 
@@ -212,4 +217,88 @@ export async function clearStepUpRequired(sessionId: string): Promise<void> {
     where: { id: sessionId },
     data: { connectStepUpRequired: false },
   });
+}
+
+// ── §15: administrative MFA override ──────────────────────────────────────────
+//
+// An override must never quietly produce an ordinary 7-day session. The session
+// minted here is flagged, given a much shorter lifetime, and pre-gated so the
+// employee has to complete real MFA before Connect will work — regardless of
+// how much of that shortened lifetime remains.
+
+export async function createMfaOverriddenSession(params: {
+  userId: string;
+  adminUserId: string;
+  ipAddress: string;
+  userAgent: string;
+}): Promise<Session> {
+  return prisma.session.create({
+    data: {
+      userId: params.userId,
+      status: SessionStatus.ACTIVE,
+      ipAddress: params.ipAddress,
+      userAgent: hashUA(params.userAgent),
+      expiresAt: new Date(Date.now() + MFA_OVERRIDE_SESSION_TTL_MS),
+      mfaOverridden: true,
+      mfaOverrideAdminId: params.adminUserId,
+      // §15: "the employee must complete fresh MFA at the next Connect attempt".
+      connectStepUpRequired: true,
+    },
+  });
+}
+
+// ── §12 / §22: bulk session invalidation ──────────────────────────────────────
+
+/**
+ * Revoke every Website 1 session for an employee.
+ *
+ * §12: after a password reset this is what stops an attacker holding a
+ * previously stolen 7-day session from carrying on. `except` exists so the
+ * session performing the reset can survive its own sweep.
+ */
+export async function revokeAllSessionsForUser(
+  userId: string,
+  options: { except?: string } = {}
+): Promise<number> {
+  const result = await prisma.session.updateMany({
+    where: {
+      userId,
+      status: { in: [SessionStatus.ACTIVE, SessionStatus.PENDING_MFA] },
+      ...(options.except ? { id: { not: options.except } } : {}),
+    },
+    data: { status: SessionStatus.REVOKED, revokedAt: new Date() },
+  });
+  return result.count;
+}
+
+// ── §10: Connect abuse cooldown ───────────────────────────────────────────────
+//
+// Distinct from the sliding-window rate limit: that throttles bursts, this is
+// the longer freeze applied once an account accumulates repeated *failures*.
+
+export async function applyConnectCooldown(sessionId: string): Promise<Date> {
+  const until = new Date(Date.now() + CONNECT_COOLDOWN_SECONDS * 1000);
+  await prisma.session.update({
+    where: { id: sessionId },
+    data: { connectCooldownUntil: until },
+  });
+  return until;
+}
+
+export function connectCooldownRemainingMs(
+  session: Pick<Session, "connectCooldownUntil">,
+  now: Date = new Date()
+): number {
+  if (!session.connectCooldownUntil) return 0;
+  return Math.max(0, session.connectCooldownUntil.getTime() - now.getTime());
+}
+
+/** Record which device credential a session most recently connected with (§5). */
+export async function bindSessionDevice(
+  sessionId: string,
+  deviceCredentialId: string
+): Promise<void> {
+  await prisma.session
+    .update({ where: { id: sessionId }, data: { deviceCredentialId } })
+    .catch(() => {});
 }

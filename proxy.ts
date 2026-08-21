@@ -1,11 +1,26 @@
 /**
- * middleware.ts
- * Next.js middleware — runs on every request before route handlers.
+ * proxy.ts
+ * Runs on every request before route handlers.
+ *
+ * (Next.js 16 renamed Middleware to Proxy; the file must be named proxy.ts and
+ * export `proxy`. The functionality is unchanged.)
  *
  * Responsibilities:
  *   1. Security headers (CSP, HSTS, X-Frame-Options, etc.) on ALL responses
- *   2. Route protection (redirect unauthenticated users away from /dashboard, /admin)
- *   3. Block direct access to mock IdP endpoints if DEV_MODE=false
+ *      — website-1-defense.md §18
+ *   2. Cheap route protection: redirect anonymous browsers away from /dashboard
+ *      and /admin
+ *   3. Block direct access to mock IdP endpoints when DEV_MODE=false
+ *
+ * WHAT THIS IS NOT
+ * ────────────────
+ * The cookie check below is an optimistic redirect, not an authorization
+ * decision. It only asks whether a session cookie is present — it does not
+ * validate it, and it cannot: a revoked or expired session still carries a
+ * cookie. Every protected route re-checks the session server-side, and the
+ * Next.js docs are explicit that Proxy "should not be used as a full session
+ * management or authorization solution". Treating this as the access control
+ * would mean anyone who sets a cookie of the right name walks in.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -14,7 +29,7 @@ import { IRON_SESSION_OPTIONS, DEV_MODE } from "./lib/config";
 // Routes that require a valid ACTIVE session
 const PROTECTED_ROUTES = ["/dashboard", "/admin"];
 
-export async function middleware(request: NextRequest): Promise<NextResponse> {
+export async function proxy(request: NextRequest): Promise<NextResponse> {
   const { pathname } = request.nextUrl;
 
   // ── Block mock IdP in production ───────────────────────────────────────────

@@ -20,12 +20,33 @@ model User {
   role       UserRole @default(EMPLOYEE)
   // External IdP subject identifier (e.g. Okta sub claim)
   idpSubject String   @unique
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
 
-  sessions             Session[]
-  authorizationTokens  AuthorizationToken[]
-  auditLogs            AuditLog[]
+  // Local credential (website-1-defense.md §12). Optional: in a pure-SSO
+  // deployment the IdP owns the password and signals changes through the
+  // IdP webhook instead (see lib/security-events).
+  passwordHash      String?
+  passwordChangedAt DateTime?
+
+  // §34 notification channels. Recovery email is deliberately separate from
+  // the corporate address so a mailbox takeover does not silence alerts.
+  recoveryEmail    String?
+  secondaryChannel String? // "sms:+1555…" | "push:<token>" — redundancy channel
+
+  // W2 §22: administrator-forced access restriction. While true, no new
+  // Gateway authorization may be issued for this employee.
+  accessRevoked   Boolean   @default(false)
+  accessRevokedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions            Session[]
+  authorizationTokens AuthorizationToken[]
+  auditLogs           AuditLog[]
+  deviceCredentials   DeviceCredential[]
+  deskSessions        DeskSession[]
+  recoveryRequests    DeviceRecoveryRequest[]
+  notifications       NotificationLog[]
 }
 
 enum UserRole {
@@ -37,19 +58,19 @@ enum UserRole {
 // Server-side sessions (7-day, revocable)
 // ─────────────────────────────────────────────
 model Session {
-  id         String        @id @default(cuid())
-  userId     String
-  user       User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   // Session state
-  status     SessionStatus @default(PENDING_MFA)
+  status    SessionStatus @default(PENDING_MFA)
   // IP address at creation time
-  ipAddress  String
+  ipAddress String
   // User-Agent fingerprint (hashed)
-  userAgent  String
+  userAgent String
   // MFA state tracking
-  mfaToken   String?       // short-lived token tying MFA challenge to this session
-  mfaExpiry  DateTime?
+  mfaToken  String? // short-lived token tying MFA challenge to this session
+  mfaExpiry DateTime?
 
   // Mini EDR (§6-7): set when a MEDIUM-risk Connect assessment blocks a
   // Connect request. Does NOT revoke the session (session stays ACTIVE) —
@@ -57,9 +78,22 @@ model Session {
   // fresh MFA step-up. Cleared by /api/auth/step-up on success.
   connectStepUpRequired Boolean @default(false)
 
-  createdAt  DateTime      @default(now())
-  expiresAt  DateTime      // now + 7 days
-  revokedAt  DateTime?
+  // §15: sessions minted through an administrative MFA override are flagged
+  // and given a shorter lifetime. They can never silently become an ordinary
+  // 7-day session, and Connect always demands fresh MFA from them.
+  mfaOverridden      Boolean @default(false)
+  mfaOverrideAdminId String?
+
+  // §10: cooldown applied after repeated Connect failures. Distinct from the
+  // sliding-window rate limit — this is a punitive, longer freeze.
+  connectCooldownUntil DateTime?
+
+  // §5/§8: device credential this session was bound to at Connect time.
+  deviceCredentialId String?
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime // now + 7 days
+  revokedAt DateTime?
 
   authorizationTokens AuthorizationToken[]
 
@@ -68,40 +102,60 @@ model Session {
 }
 
 enum SessionStatus {
-  PENDING_MFA   // SSO complete, MFA not yet verified
-  ACTIVE        // Fully authenticated
-  REVOKED       // Admin-revoked
-  EXPIRED       // Past expiresAt
+  PENDING_MFA // SSO complete, MFA not yet verified
+  ACTIVE // Fully authenticated
+  REVOKED // Admin-revoked
+  EXPIRED // Past expiresAt
 }
 
 // ─────────────────────────────────────────────
 // Authorization Tokens (short-lived, issued by mock Authorization Service)
 // ─────────────────────────────────────────────
 model AuthorizationToken {
-  id        String      @id @default(cuid())
+  id        String  @id @default(cuid())
   userId    String
-  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
   sessionId String
-  session   Session     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   // Signed JWT payload (stored for revocation lookup; never sent raw to client)
-  tokenHash String      @unique // SHA-256 of the issued token
-  // Device binding
+  tokenHash String @unique // SHA-256 of the issued token
+
+  // Telemetry only (§6) — never used as device identity.
   ipAddress String
   userAgent String
 
+  // §8: cryptographic device binding. The authorization is redeemable only by
+  // the device holding the private key for this credential.
+  deviceCredentialId String?
+  // Nonce of the device challenge consumed to mint this authorization.
+  bindingNonce       String?
+
+  targetApp String @default("operations-desk")
+
+  // §8: one-time use. Set the moment a W2 session is established from it.
+  consumedAt DateTime?
+
+  // §16-17: emergency administrative authorization.
+  emergency       Boolean @default(false)
+  issuedByAdminId String?
+
   status    AuthzStatus @default(ACTIVE)
   issuedAt  DateTime    @default(now())
-  expiresAt DateTime    // now + 5 minutes (configurable)
+  expiresAt DateTime // now + 5 minutes (configurable)
   revokedAt DateTime?
+
+  deskSession DeskSession?
 
   @@index([sessionId])
   @@index([userId])
   @@index([tokenHash])
+  @@index([deviceCredentialId])
 }
 
 enum AuthzStatus {
   ACTIVE
+  CONSUMED
   REVOKED
   EXPIRED
 }
@@ -114,7 +168,7 @@ model AuthExchangeCode {
   code      String   @unique
   userId    String
   sessionId String
-  targetApp String   // e.g. "operations-desk"
+  targetApp String // e.g. "operations-desk"
   ipAddress String
   userAgent String
   used      Boolean  @default(false)
@@ -129,26 +183,35 @@ model AuthExchangeCode {
 // Audit Logs — two streams: LOGIN and CONNECT
 // ─────────────────────────────────────────────
 model AuditLog {
-  id          String       @id @default(cuid())
-  stream      AuditStream
-  eventType   String       // e.g. SSO_INITIATED, SSO_CALLBACK, MFA_APPROVED, CONNECT_GRANTED
-  userId      String?
-  user        User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
-  sessionId   String?
-  authzId     String?
-  ipAddress   String
-  userAgent   String
-  outcome     String       // SUCCESS | FAILURE | DENIED
-  metadata    String       // JSON blob for extra event-specific data
-  createdAt   DateTime     @default(now())
+  id        String      @id @default(cuid())
+  stream    AuditStream
+  eventType String // e.g. SSO_INITIATED, SSO_CALLBACK, MFA_APPROVED, CONNECT_GRANTED
+  userId    String?
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  sessionId String?
+  authzId   String?
+  ipAddress String
+  userAgent String
+  outcome   String // SUCCESS | FAILURE | DENIED
+  severity  String      @default("INFO") // INFO | NOTICE | WARNING | HIGH | CRITICAL
+  metadata  String // JSON blob for extra event-specific data
+
+  // §11: tamper-evident chain. hash = SHA-256(prevHash || canonical entry).
+  // Rewriting or deleting any entry breaks verification of every later entry.
+  seq      Int     @unique
+  prevHash String?
+  hash     String?
+
+  createdAt DateTime @default(now())
 
   @@index([stream])
   @@index([userId])
   @@index([createdAt])
+  @@index([severity])
 }
 
 enum AuditStream {
-  LOGIN   // SSO, MFA, logout events
+  LOGIN // SSO, MFA, logout events
   CONNECT // Connect clicks, authorization events
 }
 
@@ -157,7 +220,7 @@ enum AuditStream {
 // ─────────────────────────────────────────────
 model RateLimitEvent {
   id        String   @id @default(cuid())
-  key       String   // e.g. "connect:userId:ip"
+  key       String // e.g. "connect:userId:ip"
   createdAt DateTime @default(now())
 
   @@index([key, createdAt])
@@ -174,12 +237,12 @@ model Assignment {
   id            String   @id @default(cuid())
   title         String
   description   String
-  department    String   // OPERATIONS | ENGINEERING | LOGISTICS | SUPPORT | FACILITIES | FINANCE
+  department    String // OPERATIONS | ENGINEERING | LOGISTICS | SUPPORT | FACILITIES | FINANCE
   status        String   @default("TODO") // TODO | IN_PROGRESS | COMPLETED
   priority      String   @default("STANDARD") // STANDARD | URGENT
   assigneeName  String
   assigneeEmail String
-  deadline      String   // e.g. "1700 HRS" or date
+  deadline      String // e.g. "1700 HRS" or date
   rotation      Float    @default(0.0) // random visual tilt (-1.5 to 1.5)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -193,8 +256,8 @@ model Assignment {
 // ─────────────────────────────────────────────
 model WireBulletin {
   id        String   @id @default(cuid())
-  timestamp String   // e.g. "0847"
-  category  String   // OPERATIONS | SYSTEM_STATUS | LOGISTICS | ANNOUNCEMENT | FACILITY
+  timestamp String // e.g. "0847"
+  category  String // OPERATIONS | SYSTEM_STATUS | LOGISTICS | ANNOUNCEMENT | FACILITY
   headline  String
   body      String
   urgency   String   @default("NORMAL") // NORMAL | FLASH
@@ -230,9 +293,9 @@ model StaffMember {
 model LedgerRecord {
   id           String   @id @default(cuid())
   refNumber    String   @unique // e.g. "REF-8842"
-  entryDate    String   // e.g. "2026-08-16"
+  entryDate    String // e.g. "2026-08-16"
   description  String
-  category     String   // PROCUREMENT | INFRASTRUCTURE | VENDOR_PAYMENT | TRAVEL | SUPPLIES
+  category     String // PROCUREMENT | INFRASTRUCTURE | VENDOR_PAYMENT | TRAVEL | SUPPLIES
   amount       Float
   type         String   @default("DEBIT") // DEBIT | CREDIT
   authorizedBy String
@@ -250,9 +313,9 @@ model ArchiveRecord {
   recordNumber String   @unique // e.g. "REC-0419"
   title        String
   department   String
-  filingDate   String   // e.g. "2026-08-10"
+  filingDate   String // e.g. "2026-08-10"
   summary      String
-  tags         String   // comma-separated tags
+  tags         String // comma-separated tags
   filedBy      String
   createdAt    DateTime @default(now())
 
@@ -283,12 +346,297 @@ model DeskMessage {
 model CalendarShift {
   id            String   @id @default(cuid())
   title         String
-  date          String   // e.g. "2026-08-16"
-  startTime     String   // e.g. "0800"
-  endTime       String   // e.g. "1600"
-  shiftType     String   // MORNING_SHIFT | DAY_SHIFT | NIGHT_DESK | ON_CALL | MAINTENANCE_WINDOW
-  assignedStaff String   // comma-separated staff names
+  date          String // e.g. "2026-08-16"
+  startTime     String // e.g. "0800"
+  endTime       String // e.g. "1600"
+  shiftType     String // MORNING_SHIFT | DAY_SHIFT | NIGHT_DESK | ON_CALL | MAINTENANCE_WINDOW
+  assignedStaff String // comma-separated staff names
   createdAt     DateTime @default(now())
 
   @@index([date])
+}
+
+// ═════════════════════════════════════════════
+// CRYPTOGRAPHIC DEVICE IDENTITY
+// website-1-defense.md §8 / website-2-defense.md §4, §6-§9A
+// ═════════════════════════════════════════════
+
+/// A registered device public-key credential. The matching private key is
+/// generated on the device, marked non-extractable, and never transmitted to
+/// Website 1, the Gateway, or Website 2 (W2 §4).
+model DeviceCredential {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  label String
+
+  /// Base64url SPKI encoding of the ECDSA P-256 public key.
+  publicKeySpki String
+  algorithm     String @default("ES256")
+
+  /// W2 §4 "Hardware-Backed Key Storage": a device that cannot attest to a
+  /// hardware-backed store is still admitted, but marked lower-assurance.
+  hardwareBacked Boolean @default(false)
+  assurance      String  @default("LOW") // HIGH | LOW
+
+  status DeviceCredentialStatus @default(PENDING_APPROVAL)
+
+  /// W2 §6: initial registration is administrator-approved.
+  approvedByAdminId String?
+  approvedAt        DateTime?
+
+  /// W2 §9A: periodic re-attestation and rotation, with an offline grace period.
+  lastAttestedAt DateTime?
+  rotationDueAt  DateTime
+  graceExpiresAt DateTime
+  /// Credential this one superseded during rotation/replacement.
+  replacesId     String?
+
+  revokedAt     DateTime?
+  revokedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  deskSessions DeskSession[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([publicKeySpki])
+}
+
+enum DeviceCredentialStatus {
+  PENDING_APPROVAL
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+/// W2 §4 "Cryptographic Challenge Freshness": a single-use, server-generated,
+/// unpredictable nonce. Consumed on first successful verification so a captured
+/// signature can never be replayed.
+model DeviceChallenge {
+  id                 String  @id @default(cuid())
+  nonce              String  @unique
+  userId             String
+  deviceCredentialId String?
+
+  /// REGISTRATION | CONNECT | W2_SESSION | ROTATION
+  purpose String
+
+  /// Which component issued the challenge. Website 2 issues its own (§8.1)
+  /// rather than trusting a challenge minted by Website 1 or the Gateway.
+  issuer String @default("website-1")
+
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+}
+
+// ═════════════════════════════════════════════
+// WEBSITE 2 SESSION GUARD
+// website-2-defense.md §10, §11, §17-§20
+// ═════════════════════════════════════════════
+
+/// The Website 2 work session. Deliberately a separate record from the Gateway
+/// authorization: the authorization is consumed at establishment (§3) and the
+/// session's continued validity does not depend on Website 1 or the Gateway
+/// staying reachable (W1 §22.1, W2 §26).
+model DeskSession {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  deviceCredentialId String
+  deviceCredential   DeviceCredential @relation(fields: [deviceCredentialId], references: [id], onDelete: Cascade)
+
+  /// The one-time authorization consumed to establish this session.
+  authzTokenId String             @unique
+  authzToken   AuthorizationToken @relation(fields: [authzTokenId], references: [id], onDelete: Cascade)
+
+  status DeskSessionStatus @default(ACTIVE)
+
+  /// Telemetry only — never used to authenticate the session (§5).
+  ipAddress String
+
+  createdAt         DateTime @default(now())
+  /// §17: reset by meaningful application activity only, never by background polling.
+  lastActivityAt    DateTime @default(now())
+  /// §18: hard ceiling regardless of activity.
+  absoluteExpiresAt DateTime
+
+  /// §14: last time this session re-proved possession of its device private
+  /// key. Once stale, the next request must present a fresh proof — which is
+  /// what stops a stolen session identifier being sufficient on its own.
+  deviceVerifiedAt DateTime @default(now())
+
+  revokedAt     DateTime?
+  revokedReason String?
+
+  /// §16: rotated on privileged transitions; the old identifier stops resolving.
+  rotatedFromId String?
+
+  @@index([userId])
+  @@index([status])
+  @@index([deviceCredentialId])
+}
+
+enum DeskSessionStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+// ═════════════════════════════════════════════
+// CROSS-BOUNDARY CRITICAL SECURITY EVENTS
+// website-2-defense.md §21, §32 / website-1-defense.md §12, §22.3-§22.4
+// ═════════════════════════════════════════════
+
+/// Outbox on the Authorization Service side. Delivered at-least-once through
+/// the Gateway; Website 2 acknowledges and deduplicates by eventId.
+model SecurityEvent {
+  id      String @id @default(cuid())
+  /// Idempotency key carried to Website 2.
+  eventId String @unique
+
+  /// PASSWORD_CHANGED | ACCESS_REVOKED | ADMIN_TERMINATION |
+  /// DEVICE_REVOKED | NEW_DEVICE_SESSION
+  type   String
+  userId String
+
+  payload   String
+  /// HMAC over the canonical payload — protects against forgery and tampering
+  /// in transit (§32). Replay is handled by the eventId ledger.
+  signature String
+
+  status        String    @default("PENDING") // PENDING | DELIVERED | FAILED
+  attempts      Int       @default(0)
+  lastAttemptAt DateTime?
+  lastError     String?
+  deliveredAt   DateTime?
+  ackedAt       DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([status])
+  @@index([userId])
+}
+
+/// Inbox ledger on the Website 2 side. Presence of an eventId here makes
+/// reprocessing a no-op, which is what makes at-least-once delivery safe (§21).
+model ProcessedSecurityEvent {
+  eventId     String   @id
+  type        String
+  userId      String
+  result      String
+  processedAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ═════════════════════════════════════════════
+// TRUSTED OUTAGE DETECTION
+// website-1-defense.md §16 / website-2-defense.md §27
+// ═════════════════════════════════════════════
+
+/// Health state for Website 1 and the Gateway, written ONLY by the
+/// out-of-process health monitor (scripts/health-monitor.ts). No request-path
+/// code writes this table, so Website 1 cannot declare itself unavailable.
+model ComponentHealth {
+  component String @id // "website-1" | "gateway"
+
+  state String @default("HEALTHY") // HEALTHY | DEGRADED | CONFIRMED_OUTAGE
+
+  consecutiveFailures  Int @default(0)
+  consecutiveSuccesses Int @default(0)
+
+  lastCheckAt       DateTime?
+  lastSuccessAt     DateTime?
+  firstFailureAt    DateTime?
+  confirmedOutageAt DateTime?
+
+  /// §27 "Human Confirmation": automated detection only makes the emergency
+  /// path *available*. An administrator must still explicitly confirm.
+  humanConfirmedByAdminId String?
+  humanConfirmedAt        DateTime?
+  humanConfirmExpiresAt   DateTime?
+
+  updatedAt DateTime @updatedAt
+}
+
+// ═════════════════════════════════════════════
+// ADMINISTRATIVE CONTROLS
+// website-1-defense.md §13-§15 / website-2-defense.md §5A, §22
+// ═════════════════════════════════════════════
+
+/// §14: one successful administrator re-authentication authorizes exactly one
+/// privileged action. Being logged into the admin dashboard grants nothing.
+model AdminStepUp {
+  id           String  @id @default(cuid())
+  adminUserId  String
+  /// The single action this grant may be spent on.
+  action       String
+  targetUserId String?
+  reason       String
+
+  status String @default("ISSUED") // ISSUED | CONSUMED | EXPIRED
+
+  issuedAt   DateTime  @default(now())
+  expiresAt  DateTime
+  consumedAt DateTime?
+
+  @@index([adminUserId, status])
+}
+
+/// W2 §8 / W1 §22.5: human-controlled recovery for when the device credential
+/// can no longer be used to prove possession.
+model DeviceRecoveryRequest {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  status String @default("PENDING") // PENDING | APPROVED | DENIED | COMPLETED
+  reason String
+
+  requestedAt DateTime @default(now())
+  ipAddress   String
+  userAgent   String
+
+  humanVerifiedByAdminId String?
+  humanVerifiedAt        DateTime?
+  verificationMethod     String?
+
+  approvedAt      DateTime?
+  completedAt     DateTime?
+  newCredentialId String?
+
+  @@index([userId, status])
+}
+
+// ═════════════════════════════════════════════
+// EMPLOYEE NOTIFICATIONS
+// website-2-defense.md §34 / website-1-defense.md §10, §22.5
+// ═════════════════════════════════════════════
+
+/// Delivery record for employee-facing security notifications. Alerting only —
+/// never an authorization credential, and never carries secrets (§34).
+model NotificationLog {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  channel  String // EMAIL | SMS | PUSH
+  type     String
+  severity String @default("INFO")
+  status   String // SENT | FAILED
+  detail   String
+
+  sentAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([sentAt])
 }

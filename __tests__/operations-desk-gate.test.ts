@@ -1,12 +1,23 @@
 /**
  * __tests__/operations-desk-gate.test.ts
- * Automated Gate Tests for Website 2 (The Operations Desk).
+ * Gate tests for Website 2 (The Operations Desk).
  *
  * Verifies:
  *   1. Exchange code issuance, single-use enforcement, and 60s expiration.
- *   2. Live per-request token introspection and device fingerprint binding.
- *   3. Instant token revocation enforcement.
- *   4. Operations Desk database CRUD operations (assignments, wire, ledger, archive).
+ *   2. Authorization introspection and cryptographic device binding.
+ *   3. Instant revocation enforcement.
+ *   4. Operations Desk database CRUD operations.
+ *
+ * TWO MODEL CHANGES UNDER THESE TESTS
+ * ───────────────────────────────────
+ * 1. The exchange code no longer MINTS an authorization. Connect mints it after
+ *    the risk assessment and the device proof (W1 §8); the code is only a
+ *    60-second front-channel handle for redeeming that existing grant
+ *    (W2 §3). Each test therefore issues an authorization first.
+ *
+ * 2. Device binding is cryptographic, not a hashed User-Agent. W1 §5 forbids
+ *    treating a UA string as a reliable identity signal, so the mismatch test
+ *    now presents a different device *credential*.
  */
 
 import { describe, it, expect, beforeEach } from "vitest";
@@ -15,14 +26,17 @@ import {
   issueExchangeCode,
   exchangeCodeForToken,
   introspectTokenLive,
+  issueAuthorization,
   revokeAuthorization,
   hashUA,
 } from "../lib/authz-service";
 import { SessionStatus } from "@prisma/client";
+import { createActiveCredential } from "./helpers/device";
 
 describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
   let testUserId: string;
   let testSessionId: string;
+  let testCredentialId: string;
   const testUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestBrowser/1.0";
   const testIP = "127.0.0.1";
 
@@ -51,10 +65,36 @@ describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
       },
     });
     testSessionId = session.id;
+
+    // W1 §8: every authorization is bound to a registered device credential.
+    // Retire any credential left by a previous run so the one-employee-one-device
+    // invariant holds and the newest credential is the active one.
+    await prisma.deviceCredential.updateMany({
+      where: { userId: testUserId, status: "ACTIVE" },
+      data: { status: "REVOKED", revokedAt: new Date(), revokedReason: "TEST_RESET" },
+    });
+    const { credential } = await createActiveCredential({ userId: testUserId });
+    testCredentialId = credential.id;
   });
+
+  /**
+   * Stand in for a completed Connect: a fresh 5-minute, one-time, device-bound
+   * authorization for the test session.
+   */
+  async function connect() {
+    return issueAuthorization({
+      sessionId: testSessionId,
+      userId: testUserId,
+      ipAddress: testIP,
+      userAgent: testUA,
+      deviceCredentialId: testCredentialId,
+    });
+  }
 
   describe("1. Exchange Code Handshake", () => {
     it("should issue a single-use exchange code with 60-second TTL", async () => {
+      await connect();
+
       const code = await issueExchangeCode({
         sessionId: testSessionId,
         userId: testUserId,
@@ -71,7 +111,9 @@ describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
       expect(record?.expiresAt.getTime()).toBeGreaterThan(Date.now());
     });
 
-    it("should exchange code for authorization token and prevent replay", async () => {
+    it("should exchange code for the existing authorization and prevent replay", async () => {
+      const authorization = await connect();
+
       const code = await issueExchangeCode({
         sessionId: testSessionId,
         userId: testUserId,
@@ -86,7 +128,10 @@ describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
         userAgent: testUA,
       });
 
-      expect(tokenResult.tokenId).toBeDefined();
+      // The code resolves to the grant Connect already minted — it does not
+      // mint a second one.
+      expect(tokenResult.tokenId).toBe(authorization.tokenId);
+      expect(tokenResult.deviceCredentialId).toBe(testCredentialId);
       expect(tokenResult.user.email).toBe("desk-tester@company.internal");
 
       // Second exchange with same code: MUST fail (single-use enforcement)
@@ -100,20 +145,9 @@ describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
     });
   });
 
-  describe("2. Live Per-Request Token Introspection & Device Fingerprinting", () => {
-    it("should verify active token live against database", async () => {
-      const code = await issueExchangeCode({
-        sessionId: testSessionId,
-        userId: testUserId,
-        ipAddress: testIP,
-        userAgent: testUA,
-      });
-
-      const { tokenId } = await exchangeCodeForToken({
-        code,
-        ipAddress: testIP,
-        userAgent: testUA,
-      });
+  describe("2. Authorization introspection & cryptographic device binding", () => {
+    it("should verify an active authorization against the database", async () => {
+      const { tokenId } = await connect();
 
       const verification = await introspectTokenLive({
         tokenId,
@@ -124,26 +158,25 @@ describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
       expect(verification.valid).toBe(true);
       expect(verification.userEmail).toBe("desk-tester@company.internal");
       expect(verification.userName).toBe("Desk Tester");
+      expect(verification.deviceCredentialId).toBe(testCredentialId);
     });
 
-    it("should reject token if User-Agent fingerprint mismatches", async () => {
-      const code = await issueExchangeCode({
-        sessionId: testSessionId,
-        userId: testUserId,
-        ipAddress: testIP,
-        userAgent: testUA,
-      });
+    it("should reject a grant presented with a different device credential", async () => {
+      const { tokenId } = await connect();
 
-      const { tokenId } = await exchangeCodeForToken({
-        code,
-        ipAddress: testIP,
-        userAgent: testUA,
+      const stranger = await prisma.user.create({
+        data: {
+          email: `stranger-${Date.now()}@company.internal`,
+          name: "Stranger",
+          idpSubject: `sub-stranger-${Date.now()}`,
+          role: "EMPLOYEE",
+        },
       });
+      const other = await createActiveCredential({ userId: stranger.id });
 
-      const mismatchUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) DifferentBrowser/2.0";
       const verification = await introspectTokenLive({
         tokenId,
-        userAgent: mismatchUA,
+        deviceCredentialId: other.credential.id,
         ipAddress: testIP,
       });
 
@@ -151,28 +184,28 @@ describe("Website 2 Gateway & Operations Desk Automated Tests", () => {
       expect(verification.reason).toBe("DEVICE_MISMATCH");
     });
 
-    it("should immediately enforce instant token revocation", async () => {
-      const code = await issueExchangeCode({
-        sessionId: testSessionId,
-        userId: testUserId,
+    it("should NOT reject a grant merely because the User-Agent changed (§5)", async () => {
+      // UA is telemetry. A browser change is not a device change.
+      const { tokenId } = await connect();
+
+      const verification = await introspectTokenLive({
+        tokenId,
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) DifferentBrowser/2.0",
+        deviceCredentialId: testCredentialId,
         ipAddress: testIP,
-        userAgent: testUA,
       });
 
-      const { tokenId } = await exchangeCodeForToken({
-        code,
-        ipAddress: testIP,
-        userAgent: testUA,
-      });
+      expect(verification.valid).toBe(true);
+    });
 
-      // Token is active initially
+    it("should immediately enforce revocation", async () => {
+      const { tokenId } = await connect();
+
       let check = await introspectTokenLive({ tokenId, userAgent: testUA });
       expect(check.valid).toBe(true);
 
-      // Admin revokes token
       await revokeAuthorization(tokenId);
 
-      // Next live request must be immediately denied
       check = await introspectTokenLive({ tokenId, userAgent: testUA });
       expect(check.valid).toBe(false);
       expect(check.reason).toBe("TOKEN_REVOKED");

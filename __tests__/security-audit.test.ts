@@ -17,6 +17,7 @@ import { prisma } from "../lib/db";
 import {
   issueExchangeCode,
   exchangeCodeForToken,
+  consumeAuthorization,
   introspectTokenLive,
   issueAuthorization,
   revokeAuthorization,
@@ -26,11 +27,13 @@ import { verifyEmailOTP } from "../lib/auth/email-mfa";
 import { checkRateLimit, connectRateLimitKey } from "../lib/rate-limit";
 import { AUTHZ_SIGNING_SECRET } from "../lib/config";
 import { SessionStatus } from "@prisma/client";
+import { createActiveCredential } from "./helpers/device";
 import { SignJWT, jwtVerify } from "jose";
 
 describe("GateZero Threat Defense Regression Suite", () => {
   let testUserId: string;
   let testSessionId: string;
+  let testCredentialId: string;
   const legitUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0 Safari/537.36";
   const attackerUA = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 Mobile Safari/537.36 (AttackerDevice)";
   const testIP = "192.168.1.100";
@@ -61,10 +64,28 @@ describe("GateZero Threat Defense Regression Suite", () => {
       },
     });
     testSessionId = session.id;
+
+    // W1 §8: authorizations are bound to a registered device credential.
+    // Retire anything left from a previous run so the newest credential is the
+    // employee's single active device (W2 §5).
+    await prisma.deviceCredential.updateMany({
+      where: { userId: testUserId, status: "ACTIVE" },
+      data: { status: "REVOKED", revokedAt: new Date(), revokedReason: "TEST_RESET" },
+    });
+    testCredentialId = (await createActiveCredential({ userId: testUserId })).credential.id;
   });
 
   describe("Threat Scenario 1: Replay Attacks (Code & Token Reuse)", () => {
     it("DEFENSE: Single-use exchange codes must be invalidated immediately upon first consumption", async () => {
+      // Connect mints the authorization; the code is only a handle for it.
+      await issueAuthorization({
+        sessionId: testSessionId,
+        userId: testUserId,
+        ipAddress: testIP,
+        userAgent: legitUA,
+        deviceCredentialId: testCredentialId,
+      });
+
       const code = await issueExchangeCode({
         sessionId: testSessionId,
         userId: testUserId,
@@ -148,30 +169,67 @@ describe("GateZero Threat Defense Regression Suite", () => {
   });
 
   describe("Threat Scenario 3: Session Hijacking & Device Fingerprint Mismatches", () => {
-    it("DEFENSE: Stolen authorization token used from a different device fingerprint must be blocked (DEVICE_MISMATCH)", async () => {
+    it("DEFENSE: A stolen authorization used from another device is blocked (DEVICE_MISMATCH)", async () => {
+      // The attacker has the tokenId. What they cannot have is the private key
+      // for the employee's registered credential, which never left the device.
       const { tokenId } = await issueAuthorization({
         sessionId: testSessionId,
         userId: testUserId,
         ipAddress: testIP,
         userAgent: legitUA,
+        deviceCredentialId: testCredentialId,
       });
 
-      // Legitimate user on matching device succeeds
       const legitCheck = await introspectTokenLive({
         tokenId,
+        deviceCredentialId: testCredentialId,
         userAgent: legitUA,
         ipAddress: testIP,
       });
       expect(legitCheck.valid).toBe(true);
 
-      // Attacker on different device using the stolen tokenId is blocked
+      const attacker = await prisma.user.create({
+        data: {
+          email: `attacker-${Date.now()}@zerogate.internal`,
+          name: "Attacker",
+          idpSubject: `attacker-subject-${Date.now()}`,
+          role: "EMPLOYEE",
+        },
+      });
+      const attackerCredential = (await createActiveCredential({ userId: attacker.id })).credential;
+
       const attackCheck = await introspectTokenLive({
         tokenId,
+        deviceCredentialId: attackerCredential.id,
         userAgent: attackerUA,
         ipAddress: attackerIP,
       });
       expect(attackCheck.valid).toBe(false);
       expect(attackCheck.reason).toBe("DEVICE_MISMATCH");
+    });
+
+    it("DEFENSE: A stolen authorization cannot be replayed after it is consumed (§24)", async () => {
+      // Even on the right device, one grant opens exactly one session.
+      const { tokenId } = await issueAuthorization({
+        sessionId: testSessionId,
+        userId: testUserId,
+        ipAddress: testIP,
+        userAgent: legitUA,
+        deviceCredentialId: testCredentialId,
+      });
+
+      const first = await consumeAuthorization({
+        tokenId,
+        deviceCredentialId: testCredentialId,
+      });
+      const replay = await consumeAuthorization({
+        tokenId,
+        deviceCredentialId: testCredentialId,
+      });
+
+      expect(first.ok).toBe(true);
+      expect(replay.ok).toBe(false);
+      expect(replay.reason).toBe("TOKEN_ALREADY_CONSUMED");
     });
   });
 
@@ -204,6 +262,7 @@ describe("GateZero Threat Defense Regression Suite", () => {
           userId: testUserId,
           ipAddress: testIP,
           userAgent: legitUA,
+          deviceCredentialId: testCredentialId,
         })
       ).rejects.toThrow("SESSION_INVALID");
     });
@@ -245,6 +304,7 @@ describe("GateZero Threat Defense Regression Suite", () => {
         userId: testUserId,
         ipAddress: testIP,
         userAgent: legitUA,
+        deviceCredentialId: testCredentialId,
       });
 
       // Token is valid initially

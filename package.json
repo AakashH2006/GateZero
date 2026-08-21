@@ -15,7 +15,9 @@
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
     "db:seed-desk": "tsx --env-file=.env.local prisma/seed-dispatch.ts",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "health-monitor": "tsx --env-file=.env.local scripts/health-monitor.ts",
+    "e2e": "node scripts/e2e-flow.mjs"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

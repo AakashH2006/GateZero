@@ -49,14 +49,18 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
       if (parsed.data.action === "send_email") {
         const result = await sendEmailOTP(session.id, session.user.email);
+        // Dispatching a challenge is not an approval. The distinct event type
+        // is what lets the Mini EDR see a burst of challenges as the
+        // MFA-fatigue pattern it is (website-1-defense.md §6).
         void auditLogin({
-          eventType: "MFA_PUSH_APPROVED",
+          eventType: "MFA_CODE_SENT",
           userId: session.userId,
           sessionId: session.id,
           ipAddress: ip,
           userAgent: ua,
-          outcome: "SUCCESS",
-          metadata: { method: "email_otp_sent", email: session.user.email },
+          outcome: result.success ? "SUCCESS" : "FAILURE",
+          severity: "NOTICE",
+          metadata: { method: "email_otp" },
         });
 
         return NextResponse.json({

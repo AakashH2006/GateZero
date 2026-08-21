@@ -2,164 +2,1054 @@
  * server-desk.ts
  * ═══════════════════════════════════════════════════════════════════════════════
  * WEBSITE 2: THE OPERATIONS DESK
+ * website-2-defense.md (whole document) / website-1-defense.md §8.1, §22
  * ═══════════════════════════════════════════════════════════════════════════════
  *
- * Standalone company operations & dispatch application running on PORT 3002.
- * Gated strictly by Website 1 (GateZero Access Gateway at PORT 3000) via:
- *   1. OIDC-Style Exchange Code Handshake (/api/auth/callback?code=...)
- *   2. Live Per-Request Token Introspection (/api/authz/verify on PORT 3000)
- *   3. Neutral Enterprise Gateway Intercept Screen on unauthorized access
+ * The protected work environment, on PORT 3002.
+ *
+ * ARCHITECTURE (§1, §35)
+ * ──────────────────────
+ *   Website 1 proves identity. The Gateway authorizes access.
+ *   Website 2 independently protects the work session.
+ *
+ * Three properties follow from that, and they shape everything below:
+ *
+ *   1. INDEPENDENT DEVICE VERIFICATION (§8.1, §4). Website 2 does not accept
+ *      the Gateway's assertion that a device is legitimate. It issues its OWN
+ *      challenge nonce and verifies the signature itself. A Gateway that forged
+ *      or mis-validated a device binding still cannot produce a trusted session
+ *      here.
+ *
+ *   2. SESSION INDEPENDENCE (§26, §35, W1 §22.1). Once established, the session
+ *      is validated from local state. Website 2 does not call the Gateway per
+ *      request, and an existing session survives a Website 1 or Gateway outage.
+ *
+ *   3. NARROW EVENT INTAKE (§21, §32). The only thing that crosses the boundary
+ *      afterwards is a small set of critical security events, which Website 2
+ *      PULLS. There is no inbound endpoint that can push a session termination
+ *      into Website 2, so nothing on the network can forge one.
+ *
+ * OUT OF SCOPE (§1): what an authenticated employee may see or do inside the
+ * Desk — role-based access control and data permissions are the application's
+ * own concern, addressed separately from how the employee got here.
  */
 
+import crypto from "crypto";
 import express, { Request, Response, NextFunction } from "express";
 import cookieParser from "cookie-parser";
 import { prisma } from "./lib/db";
+import { signServiceRequest, verifyServiceRequest } from "./lib/service-auth";
+import {
+  issueDeviceChallenge,
+  verifyDeviceProof,
+  credentialUsability,
+} from "./lib/device";
+import {
+  establishDeskSession,
+  validateDeskSession,
+  touchDeskSession,
+  revokeDeskSession,
+  revokeAllForUser,
+  recordDeviceVerification,
+  rotateDeskSessionId,
+  isMeaningfulActivity,
+} from "./lib/desk-session";
+import {
+  processSecurityEvent,
+  type DeliverableEvent,
+} from "./lib/security-events";
+import { notifyEmployeeById } from "./lib/notify";
+import { deskSessionLimits, ORG_MODE, DESK_DEVICE_REVERIFY_MS } from "./lib/config";
+import { consumeStepUp } from "./lib/admin-stepup";
 
 const app = express();
 const PORT = 3002;
 const HOST = process.env.HOST || "127.0.0.1";
-const GATEWAY_URL = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 
-// Security Headers Middleware
+/**
+ * The Gateway's address. Website 2 talks to the Gateway; it never talks to
+ * Website 1 directly (§2, §35).
+ */
+const GATEWAY_URL = process.env.GATEWAY_URL || process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+
+const SESSION_COOKIE = "desk_session";
+const HANDSHAKE_COOKIE = "desk_handshake";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Security headers (§13)
+// ─────────────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
-  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
+  res.setHeader("Cache-Control", "no-store");
   next();
 });
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "256kb" }));
+app.use(express.urlencoded({ extended: true, limit: "256kb" }));
 app.use(cookieParser());
 
-// Extend express Request to include verified user claims
 interface AuthRequest extends Request {
-  user?: {
-    id: string;
-    email: string;
-    name: string;
-    role: string;
-  };
-  tokenId?: string;
+  user?: { id: string; email: string; name: string; role: string };
+  deskSessionId?: string;
+  deviceCredentialId?: string;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Live Gateway Verification Middleware (Per-Request Introspection)
+// Website 2 security logging (§33)
 // ─────────────────────────────────────────────────────────────────────────────
-async function requireGatewayAuth(req: AuthRequest, res: Response, next: NextFunction) {
-  const tokenId = req.cookies?.desk_tokenId || (req.headers.authorization?.replace(/^Bearer\s+/i, ""));
+//
+// Website 2 does not use the Mini EDR (§33): continuous endpoint telemetry
+// would create needless log volume and couple the Desk to Website 1's
+// monitoring. It records its own session-scoped security events instead, and
+// never records secrets.
 
-  if (!tokenId) {
-    if (req.path.startsWith("/api/")) {
-      return res.status(401).json({ error: "GATEWAY_AUTH_REQUIRED", reason: "MISSING_TOKEN" });
-    }
-    return res.status(401).send(renderNeutralInterceptScreen("NO_ACTIVE_TOKEN"));
+type DeskEventType =
+  | "SESSION_CREATED"
+  | "SESSION_EXPIRED"
+  | "SESSION_REPLACED"
+  | "SESSION_REVOKED"
+  | "DEVICE_MISMATCH"
+  | "DEVICE_PROOF_FAILED"
+  | "DEVICE_REVERIFICATION_REQUIRED"
+  | "CREDENTIAL_REVOKED"
+  | "AUTHZ_REPLAY"
+  | "HANDSHAKE_FAILED"
+  | "SECURITY_EVENT_PROCESSED"
+  | "SECURITY_EVENT_REJECTED"
+  | "EMERGENCY_ACCESS"
+  | "OOB_REVOCATION"
+  | "RECONCILIATION";
+
+function deskLog(
+  type: DeskEventType,
+  detail: Record<string, unknown> = {}
+): void {
+  console.log(
+    JSON.stringify({
+      ts: new Date().toISOString(),
+      component: "operations-desk",
+      event: type,
+      ...detail,
+    })
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Gateway calls (§25) — service-authenticated, never bare HTTP
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function callGateway<T>(
+  path: string,
+  body: unknown
+): Promise<{ ok: boolean; status: number; data: T | null }> {
+  const payload = JSON.stringify(body ?? {});
+  const res = await fetch(`${GATEWAY_URL}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...signServiceRequest({ serviceId: "operations-desk", path, body: payload }),
+    },
+    body: payload,
+  });
+
+  const data = (await res.json().catch(() => null)) as T | null;
+  return { ok: res.ok, status: res.status, data };
+}
+
+async function getFromGateway<T>(path: string): Promise<T | null> {
+  const res = await fetch(`${GATEWAY_URL}${path}`, {
+    method: "GET",
+    headers: signServiceRequest({ serviceId: "operations-desk", path, body: "" }),
+  });
+  if (!res.ok) return null;
+  return (await res.json().catch(() => null)) as T | null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Handshake state (§3)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Between redeeming the exchange code and completing Website 2's own device
+// check, the pending handshake lives here — in memory, short-lived, and never
+// in a cookie. The browser holds only an opaque handle.
+//
+// It is deliberately NOT a session: it confers no access, and it expires in
+// two minutes whether or not the device answers the challenge.
+
+interface PendingHandshake {
+  tokenId: string;
+  userId: string;
+  deviceCredentialId: string;
+  /** Public key as delivered by the Gateway, cross-checked at verification. */
+  publicKeySpki: string;
+  emergency: boolean;
+  expiresAt: number;
+}
+
+const handshakes = new Map<string, PendingHandshake>();
+
+function putHandshake(id: string, handshake: PendingHandshake): void {
+  handshakes.set(id, handshake);
+}
+
+function takeHandshake(id: string | undefined): PendingHandshake | null {
+  if (!id) return null;
+  const found = handshakes.get(id);
+  if (!found) return null;
+  if (found.expiresAt < Date.now()) {
+    handshakes.delete(id);
+    return null;
+  }
+  return found;
+}
+
+// Periodic sweep so an abandoned handshake cannot accumulate.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, handshake] of handshakes) {
+    if (handshake.expiresAt < now) handshakes.delete(id);
+  }
+}, 60_000).unref?.();
+
+function randomId(): string {
+  return crypto.randomBytes(24).toString("hex");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Session Guard middleware (§10, §13, §14, §17, §18)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Purely local. No Gateway call, no Website 1 call — that independence is what
+// lets an established session survive an upstream outage (§26).
+
+async function requireDeskSession(
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const sessionId = req.cookies?.[SESSION_COOKIE];
+
+  if (!sessionId) {
+    deny(req, res, "NO_ACTIVE_SESSION");
+    return;
   }
 
-  try {
-    const clientUA = (req.headers["user-agent"] as string) || "unknown-ua";
-    const clientIP = req.ip || "127.0.0.1";
+  const validation = await validateDeskSession({ sessionId });
 
-    // Perform LIVE introspection check against Website 1 Gateway on EVERY request
-    const response = await fetch(`${GATEWAY_URL}/api/authz/verify`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Client-User-Agent": clientUA,
-        "X-Client-IP": clientIP,
-      },
-      body: JSON.stringify({ tokenId, userAgent: clientUA, ipAddress: clientIP }),
+  if (!validation.valid || !validation.session) {
+    res.clearCookie(SESSION_COOKIE);
+    deskLog(
+      validation.reason === "SESSION_EXPIRED" ? "SESSION_EXPIRED" : "SESSION_REVOKED",
+      { reason: validation.reason }
+    );
+    deny(req, res, validation.reason ?? "SESSION_INVALID");
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { id: validation.session.userId },
+    select: { id: true, email: true, name: true, role: true, accessRevoked: true },
+  });
+
+  // Belt and braces alongside the ACCESS_REVOKED event: if the event has not
+  // arrived yet, the flag is still authoritative here.
+  if (!user || user.accessRevoked) {
+    await revokeDeskSession(validation.session.id, "ACCESS_REVOKED");
+    res.clearCookie(SESSION_COOKIE);
+    deny(req, res, "ACCESS_REVOKED");
+    return;
+  }
+
+  // §14: the session identifier alone is never sufficient. When the device
+  // proof has gone stale the request is held until the caller re-proves
+  // possession of the private key. The session is NOT revoked — a legitimate
+  // browser re-signs transparently and continues, while someone holding only a
+  // stolen cookie can never satisfy this and is stopped here.
+  if (validation.deviceReverificationRequired) {
+    deskLog("DEVICE_REVERIFICATION_REQUIRED", {
+      userId: validation.session.userId,
+      sessionId: validation.session.id,
     });
 
-    if (!response.ok) {
-      const data = await response.json().catch(() => ({}));
-      res.clearCookie("desk_tokenId");
-      if (req.path.startsWith("/api/")) {
-        return res.status(401).json({ error: "GATEWAY_REVOKED", reason: data.reason || "TOKEN_INVALID" });
-      }
-      return res.status(401).send(renderNeutralInterceptScreen(data.reason || "TOKEN_REVOKED_OR_EXPIRED"));
-    }
-
-    const verification = await response.json();
-    if (!verification.valid || !verification.user) {
-      res.clearCookie("desk_tokenId");
-      if (req.path.startsWith("/api/")) {
-        return res.status(401).json({ error: "GATEWAY_DENIED", reason: verification.reason });
-      }
-      return res.status(401).send(renderNeutralInterceptScreen(verification.reason || "VERIFICATION_FAILED"));
-    }
-
-    req.user = verification.user;
-    req.tokenId = tokenId;
-    next();
-  } catch (err: any) {
-    console.error("[Gatekeeper] Failed to verify token with Gateway:", err?.message || err);
     if (req.path.startsWith("/api/")) {
-      return res.status(503).json({ error: "GATEWAY_UNAVAILABLE" });
+      res.status(401).json({ error: "DEVICE_REVERIFICATION_REQUIRED" });
+      return;
     }
-    return res.status(503).send(renderNeutralInterceptScreen("GATEWAY_CONNECTION_ERROR"));
+    res.status(401).send(renderDeviceVerificationScreen(req.originalUrl));
+    return;
   }
+
+  req.user = { id: user.id, email: user.email, name: user.name, role: user.role };
+  req.deskSessionId = validation.session.id;
+  req.deviceCredentialId = validation.session.deviceCredentialId;
+
+  // §17: only meaningful application activity extends the session. Background
+  // polling deliberately does not, so an abandoned tab cannot keep a session
+  // alive forever.
+  if (isMeaningfulActivity(req.method, req.path)) {
+    void touchDeskSession(validation.session.id);
+  }
+
+  next();
+}
+
+/**
+ * A single denial shape for every failure.
+ *
+ * §15: the external response stays generic. An attacker learns that access was
+ * refused, never whether the grant was expired, consumed, bound elsewhere, or
+ * simply absent — the specific reason goes to the local log only.
+ */
+function deny(req: Request, res: Response, reason: string): void {
+  if (req.path.startsWith("/api/")) {
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+  res.status(401).send(renderNeutralInterceptScreen(reason));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Handshake Callback Endpoint (Back-Channel Code Exchange)
+// 3. Handshake: exchange code → device challenge → session (§3, §4, §8.1, §11)
 // ─────────────────────────────────────────────────────────────────────────────
+
 app.get("/api/auth/callback", async (req: Request, res: Response) => {
-  const code = req.query.code as string;
+  const code = typeof req.query.code === "string" ? req.query.code : "";
 
   if (!code) {
-    return res.status(400).send(renderNeutralInterceptScreen("MISSING_EXCHANGE_CODE"));
+    res.status(400).send(renderNeutralInterceptScreen("MISSING_EXCHANGE_CODE"));
+    return;
   }
 
   try {
-    const clientUA = (req.headers["user-agent"] as string) || "unknown-ua";
-    const clientIP = req.ip || "127.0.0.1";
+    const exchange = await callGateway<{
+      success: boolean;
+      tokenId: string;
+      emergency: boolean;
+      device: { credentialId: string; publicKeySpki: string; algorithm: string };
+      user: { id: string; name: string; email: string; role: string };
+    }>("/api/authz/exchange", { code });
 
-    // Back-channel exchange with Website 1 Gateway
-    const exchangeRes = await fetch(`${GATEWAY_URL}/api/authz/exchange`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Client-User-Agent": clientUA,
-        "X-Client-IP": clientIP,
-      },
-      body: JSON.stringify({ code, userAgent: clientUA, ipAddress: clientIP }),
-    });
-
-    const data = await exchangeRes.json();
-
-    if (!exchangeRes.ok || !data.success || !data.tokenId) {
-      return res.status(401).send(renderNeutralInterceptScreen(data.error || "EXCHANGE_CODE_FAILED"));
+    if (!exchange.ok || !exchange.data?.success || !exchange.data.tokenId) {
+      deskLog("HANDSHAKE_FAILED", { stage: "exchange", status: exchange.status });
+      res.status(401).send(renderNeutralInterceptScreen("GATEWAY_AUTHORIZATION_REQUIRED"));
+      return;
     }
 
-    // Set secure HttpOnly session cookie
-    res.cookie("desk_tokenId", data.tokenId, {
-      httpOnly: true,
-      sameSite: "lax",
-      maxAge: (data.ttlSeconds || 300) * 1000,
+    const { tokenId, device, user, emergency } = exchange.data;
+
+    // The authorization is NOT consumed yet. Website 2 must first satisfy
+    // itself about the device (§8.1); consuming here would burn the employee's
+    // grant on a handshake that has not produced a session.
+    const handshakeId = randomId();
+    putHandshake(handshakeId, {
+      tokenId,
+      userId: user.id,
+      deviceCredentialId: device.credentialId,
+      publicKeySpki: device.publicKeySpki,
+      emergency: Boolean(emergency),
+      expiresAt: Date.now() + 2 * 60 * 1000,
     });
 
-    return res.redirect("/");
-  } catch (err: any) {
-    console.error("[Callback] Code exchange error:", err?.message || err);
-    return res.status(500).send(renderNeutralInterceptScreen("HANDSHAKE_NETWORK_ERROR"));
+    res.cookie(HANDSHAKE_COOKIE, handshakeId, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 2 * 60 * 1000,
+      path: "/",
+    });
+
+    res.send(renderDeviceVerificationScreen());
+  } catch (err) {
+    deskLog("HANDSHAKE_FAILED", {
+      stage: "exchange",
+      error: err instanceof Error ? err.message : "unknown",
+    });
+    res.status(503).send(renderNeutralInterceptScreen("GATEWAY_UNAVAILABLE"));
   }
 });
 
-// Logout endpoint
-app.all("/api/auth/logout", (req: Request, res: Response) => {
-  res.clearCookie("desk_tokenId");
-  return res.redirect(`${GATEWAY_URL}/dashboard`);
+/**
+ * Website 2's OWN challenge (§4, §8.1).
+ *
+ * Issued by Website 2, recorded with issuer "website-2", and signed by the
+ * device over a message that names that issuer. A signature produced for
+ * Website 1's Connect challenge therefore cannot be presented here.
+ */
+app.post("/api/auth/device-challenge", async (req: Request, res: Response) => {
+  // Two callers need a challenge: a pending handshake establishing a session,
+  // and an established session whose §14 re-verification has come due.
+  const handshake = takeHandshake(req.cookies?.[HANDSHAKE_COOKIE]);
+
+  let userId: string | undefined;
+  let deviceCredentialId: string | undefined;
+
+  if (handshake) {
+    userId = handshake.userId;
+    deviceCredentialId = handshake.deviceCredentialId;
+  } else {
+    const sessionId = req.cookies?.[SESSION_COOKIE];
+    if (sessionId) {
+      // Read the session directly rather than through validateDeskSession:
+      // that would report the session as needing re-verification, which is
+      // precisely the state we are issuing this challenge to resolve.
+      const session = await prisma.deskSession.findUnique({ where: { id: sessionId } });
+      if (session && session.status === "ACTIVE") {
+        userId = session.userId;
+        deviceCredentialId = session.deviceCredentialId;
+      }
+    }
+  }
+
+  if (!userId || !deviceCredentialId) {
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const challenge = await issueDeviceChallenge({
+    userId,
+    purpose: "W2_SESSION",
+    issuer: "website-2",
+    deviceCredentialId,
+  });
+
+  res.json({ nonce: challenge.nonce, expiresAt: challenge.expiresAt });
+});
+
+/**
+ * §14: re-prove possession of the session's device private key.
+ *
+ * Pinned to the credential the session was established with, so a valid proof
+ * from some *other* registered device cannot refresh someone else's session.
+ * On success the verification window restarts; the session's inactivity and
+ * absolute lifetimes are untouched, because re-verification is a theft control,
+ * not a way to extend a session past its §17/§18 limits.
+ */
+app.post("/api/auth/device-reverify", async (req: Request, res: Response) => {
+  const sessionId = req.cookies?.[SESSION_COOKIE];
+  if (!sessionId) {
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const session = await prisma.deskSession.findUnique({ where: { id: sessionId } });
+  if (!session || session.status !== "ACTIVE") {
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const { nonce, signature } = req.body ?? {};
+  if (typeof nonce !== "string" || typeof signature !== "string") {
+    res.status(400).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const proof = await verifyDeviceProof({
+    userId: session.userId,
+    proof: { nonce, signature },
+    purpose: "W2_SESSION",
+    issuer: "website-2",
+    expectedCredentialId: session.deviceCredentialId,
+  });
+
+  if (!proof.valid) {
+    deskLog("DEVICE_PROOF_FAILED", {
+      userId: session.userId,
+      sessionId: session.id,
+      stage: "reverification",
+      reason: proof.reason,
+    });
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  await recordDeviceVerification(session.id);
+
+  // §16: "Website 2 should rotate session identifiers after important
+  // authentication transitions. An old session identifier must become invalid
+  // after rotation."
+  //
+  // Re-proving possession of the device key IS such a transition, and it is the
+  // one that recurs during a session's life — so rotating here means a leaked
+  // identifier stops resolving within one verification window even if the leak
+  // is never detected. Lifetimes are untouched; only the name changes.
+  const rotated = await rotateDeskSessionId(session.id);
+
+  if (rotated) {
+    const limits = deskSessionLimits();
+    res.cookie(SESSION_COOKIE, rotated.id, {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: process.env.NODE_ENV === "production",
+      // Cap the cookie at the session's REMAINING absolute lifetime, not a
+      // fresh full window — rotation must not extend a session past §18.
+      maxAge: Math.max(
+        0,
+        Math.min(limits.absoluteMs, rotated.absoluteExpiresAt.getTime() - Date.now())
+      ),
+      path: "/",
+    });
+  }
+
+  res.json({ success: true });
+});
+
+/**
+ * Verify the device proof, redeem the authorization, establish the session.
+ *
+ * Order matters and is enforced strictly:
+ *   1. verify the device signature locally  (§8.1 — independent of the Gateway)
+ *   2. redeem the one-time authorization    (§24 — only now is it spent)
+ *   3. establish the session, replacing any incumbent (§11)
+ *
+ * §11 is explicit that an existing session must survive a *failed* attempt by
+ * another device. Because the incumbent is only revoked inside step 3, every
+ * failure above returns before the existing session is touched.
+ */
+app.post("/api/auth/device-proof", async (req: Request, res: Response) => {
+  const handshakeId = req.cookies?.[HANDSHAKE_COOKIE];
+  const handshake = takeHandshake(handshakeId);
+
+  if (!handshake) {
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const { nonce, signature } = req.body ?? {};
+  if (typeof nonce !== "string" || typeof signature !== "string") {
+    res.status(400).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  // ── Step 1: Website 2's own cryptographic verification (§8.1) ────────────
+  const proof = await verifyDeviceProof({
+    userId: handshake.userId,
+    proof: { nonce, signature },
+    purpose: "W2_SESSION",
+    issuer: "website-2",
+    expectedCredentialId: handshake.deviceCredentialId,
+  });
+
+  if (!proof.valid || !proof.credential) {
+    deskLog("DEVICE_PROOF_FAILED", {
+      userId: handshake.userId,
+      reason: proof.reason,
+    });
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  // Cross-check the key the Gateway claimed against the credential of record.
+  // A Gateway that mis-reported which key it bound is caught here rather than
+  // silently trusted — which is the substance of §8.1's "second, independent
+  // checkpoint".
+  if (proof.credential.publicKeySpki !== handshake.publicKeySpki) {
+    deskLog("DEVICE_MISMATCH", {
+      userId: handshake.userId,
+      reason: "GATEWAY_KEY_DISAGREEMENT",
+    });
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const usability = credentialUsability(proof.credential);
+  if (!usability.usable) {
+    deskLog("CREDENTIAL_REVOKED", {
+      userId: handshake.userId,
+      reason: usability.reason,
+    });
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  // ── Step 2: spend the one-time authorization (§3 step 9, §24) ───────────
+  const redeem = await callGateway<{ success: boolean }>("/api/authz/redeem", {
+    tokenId: handshake.tokenId,
+    deviceCredentialId: handshake.deviceCredentialId,
+  });
+
+  if (!redeem.ok || !redeem.data?.success) {
+    deskLog("AUTHZ_REPLAY", { userId: handshake.userId, status: redeem.status });
+    res.status(401).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  // The handshake is single-use: consumed now, whatever happens next.
+  handshakes.delete(handshakeId);
+
+  // ── Step 3: establish, replacing any incumbent session (§11, §12) ───────
+  const { session, replacedSessionIds } = await establishDeskSession({
+    userId: handshake.userId,
+    deviceCredentialId: handshake.deviceCredentialId,
+    authzTokenId: handshake.tokenId,
+    ipAddress: req.ip || "unknown",
+  });
+
+  const limits = deskSessionLimits();
+
+  res.clearCookie(HANDSHAKE_COOKIE);
+  res.cookie(SESSION_COOKIE, session.id, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    // The cookie is capped by the absolute lifetime, but the server-side
+    // record remains authoritative — a cookie that outlives its session
+    // resolves to nothing (§3: server time decides).
+    maxAge: limits.absoluteMs,
+    path: "/",
+  });
+
+  deskLog("SESSION_CREATED", {
+    userId: handshake.userId,
+    sessionId: session.id,
+    deviceCredentialId: handshake.deviceCredentialId,
+    emergency: handshake.emergency,
+    replaced: replacedSessionIds.length,
+  });
+
+  // §12: the employee is told when a new session replaced their previous one.
+  // §34: the message carries no tokens, codes, or internal security detail.
+  void notifyEmployeeById(
+    handshake.userId,
+    replacedSessionIds.length > 0 ? "W2_SESSION_REPLACED" : "W2_SESSION_ESTABLISHED"
+  );
+
+  if (handshake.emergency) {
+    deskLog("EMERGENCY_ACCESS", { userId: handshake.userId, sessionId: session.id });
+    void notifyEmployeeById(handshake.userId, "W2_EMERGENCY_ACCESS");
+  }
+
+  if (replacedSessionIds.length > 0) {
+    deskLog("SESSION_REPLACED", {
+      userId: handshake.userId,
+      replacedSessionIds,
+    });
+  }
+
+  res.json({ success: true });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. REST API Endpoints (Protected by Live Gateway Verification)
+// 4. Session status and logout (§19, §20)
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get("/api/desk/session", requireDeskSession, async (req: AuthRequest, res: Response) => {
+  const session = await prisma.deskSession.findUnique({
+    where: { id: req.deskSessionId! },
+    select: { createdAt: true, lastActivityAt: true, absoluteExpiresAt: true },
+  });
+
+  const limits = deskSessionLimits();
+
+  res.json({
+    user: req.user,
+    orgMode: ORG_MODE,
+    session: session && {
+      createdAt: session.createdAt,
+      lastActivityAt: session.lastActivityAt,
+      absoluteExpiresAt: session.absoluteExpiresAt,
+      inactivityExpiresAt: new Date(
+        session.lastActivityAt.getTime() + limits.inactivityMs
+      ),
+    },
+  });
+});
+
+/**
+ * §20: logging out of Website 2 affects Website 2 only.
+ *
+ * The Website 1 session stays signed in, and the employee can Connect again to
+ * establish a new Website 2 session. The authorization behind this session is
+ * invalidated with it.
+ */
+app.all("/api/auth/logout", async (req: Request, res: Response) => {
+  const sessionId = req.cookies?.[SESSION_COOKIE];
+  if (sessionId) {
+    await revokeDeskSession(sessionId, "USER_LOGOUT");
+    deskLog("SESSION_REVOKED", { sessionId, reason: "USER_LOGOUT" });
+  }
+  res.clearCookie(SESSION_COOKIE);
+  res.redirect(`${GATEWAY_URL}/dashboard`);
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Out-of-band administrative revocation (§26)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Used when the Gateway is unavailable but a Website 2 session must be ended.
+//
+// §26 constrains this channel severely, and the constraint is structural rather
+// than advisory: this handler contains exactly one operation. It cannot create
+// sessions, authorize devices, bypass MFA, mint credentials, or alter security
+// controls, because no code path here does any of those things.
+//
+// It still requires service authentication AND a fresh administrator step-up
+// grant issued for this specific action, and every use is logged.
+
+app.post("/api/oob/revoke", async (req: Request, res: Response) => {
+  const raw = JSON.stringify(req.body ?? {});
+
+  const auth = verifyServiceRequest({
+    headers: req.headers as Record<string, string | undefined>,
+    path: "/api/oob/revoke",
+    body: raw,
+    allowedServices: ["admin-oob"],
+  });
+
+  if (!auth.authorized) {
+    deskLog("OOB_REVOCATION", { outcome: "DENIED", reason: auth.reason });
+    res.status(403).json({ error: "ACCESS_DENIED" });
+    return;
+  }
+
+  const { targetUserId, adminUserId, stepUpId, reason } = req.body ?? {};
+  if (
+    typeof targetUserId !== "string" ||
+    typeof adminUserId !== "string" ||
+    typeof stepUpId !== "string" ||
+    typeof reason !== "string"
+  ) {
+    res.status(400).json({ error: "INVALID_REQUEST" });
+    return;
+  }
+
+  // §14 and §26: "The administrator must reauthenticate before performing the
+  // revocation." The grant is spent here, and it must have been issued for
+  // this action against this employee.
+  const stepUp = await consumeStepUp({
+    stepUpId,
+    adminUserId,
+    action: "OOB_REVOKE_W2_SESSION",
+    targetUserId,
+  });
+
+  if (!stepUp.ok) {
+    deskLog("OOB_REVOCATION", {
+      outcome: "DENIED",
+      reason: stepUp.reason,
+      adminUserId,
+      targetUserId,
+    });
+    res.status(403).json({ error: "STEP_UP_REQUIRED" });
+    return;
+  }
+
+  const revoked = await revokeAllForUser(targetUserId, `OOB_ADMIN_REVOCATION:${reason}`);
+
+  // §26: logged as a high-priority security event.
+  deskLog("OOB_REVOCATION", {
+    outcome: "SUCCESS",
+    severity: "HIGH",
+    adminUserId,
+    targetUserId,
+    justification: reason,
+    revokedSessionIds: revoked,
+  });
+
+  res.json({ success: true, revokedSessions: revoked.length });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. Critical security event intake (§21, §32)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Website 2 pulls; nothing pushes. Each event is HMAC-verified and applied
+// through the idempotency ledger, so redelivery of an already-applied event is
+// a no-op — which is what makes at-least-once delivery safe.
+//
+// Only after an event has actually been applied is it acknowledged. An event
+// that fails to apply stays pending upstream and is redelivered.
+
+async function applyCriticalEvent(event: DeliverableEvent): Promise<string> {
+  const { type, userId, payload } = event;
+
+  switch (type) {
+    // §21: a password change terminates every Website 2 session for the
+    // employee. Without this, a reset would lock the attacker out of Website 1
+    // while leaving them working inside Website 2.
+    case "PASSWORD_CHANGED":
+    case "ACCESS_REVOKED":
+    case "ADMIN_TERMINATION": {
+      const revoked = await revokeAllForUser(userId, type);
+      return `REVOKED_${revoked.length}`;
+    }
+
+    // §9 / W1 §22.3: sessions bound to a revoked or superseded credential end.
+    // Scoped to the named credentials so a device replacement does not tear
+    // down the session the new device just established.
+    //
+    // NEW_DEVICE_SESSION is handled but never enqueued here: Website 2 owns its
+    // own session store, so establishDeskSession already revokes the prior
+    // sessions at the moment the new device establishes (§11). The branch is
+    // kept so a deployment where Website 2 cannot observe establishment
+    // directly still terminates correctly rather than falling through to the
+    // unknown-type no-op.
+    case "DEVICE_REVOKED":
+    case "NEW_DEVICE_SESSION": {
+      const revoked = await revokeAllForUser(userId, type, {
+        deviceCredentialIds: payload.deviceCredentialIds,
+        except: payload.exceptDeskSessionId,
+      });
+      return `REVOKED_${revoked.length}`;
+    }
+
+    default:
+      return "IGNORED_UNKNOWN_TYPE";
+  }
+}
+
+async function pollSecurityEvents(): Promise<void> {
+  try {
+    const result = await getFromGateway<{ events: DeliverableEvent[] }>("/api/events");
+    if (!result?.events?.length) return;
+
+    const acknowledged: string[] = [];
+
+    for (const event of result.events) {
+      const outcome = await processSecurityEvent(event, applyCriticalEvent);
+
+      if (outcome.processed) {
+        acknowledged.push(event.eventId);
+        deskLog("SECURITY_EVENT_PROCESSED", {
+          eventId: event.eventId,
+          type: event.type,
+          userId: event.userId,
+          duplicate: outcome.duplicate,
+        });
+      } else {
+        // Not acknowledged — it stays pending upstream and will be retried.
+        // A signature failure is never acknowledged: acknowledging it would
+        // let a forged event silently retire a real one.
+        deskLog("SECURITY_EVENT_REJECTED", {
+          eventId: event.eventId,
+          type: event.type,
+          reason: outcome.reason,
+        });
+      }
+    }
+
+    if (acknowledged.length > 0) {
+      await callGateway("/api/events", { eventIds: acknowledged });
+    }
+  } catch (err) {
+    // The Gateway being unreachable is not a reason to touch existing sessions
+    // (§26). The poller simply retries.
+    deskLog("SECURITY_EVENT_REJECTED", {
+      reason: "GATEWAY_UNREACHABLE",
+      error: err instanceof Error ? err.message : "unknown",
+    });
+  }
+}
+
+/**
+ * §21 fallback reconciliation.
+ *
+ * If delivery cannot be confirmed, Website 2 re-derives the employee's critical
+ * account state from the system of record rather than assuming that no event
+ * means nothing happened.
+ */
+async function reconcileActiveSessions(): Promise<void> {
+  try {
+    const active = await prisma.deskSession.findMany({
+      where: { status: "ACTIVE" },
+      select: { userId: true },
+      distinct: ["userId"],
+    });
+
+    for (const { userId } of active) {
+      const state = await getFromGateway<{
+        state: { accessRevoked: boolean; activeCredentialIds: string[] };
+      }>(`/api/events?reconcile=${encodeURIComponent(userId)}`);
+
+      if (!state?.state) continue;
+
+      if (state.state.accessRevoked) {
+        const revoked = await revokeAllForUser(userId, "RECONCILED_ACCESS_REVOKED");
+        deskLog("RECONCILIATION", { userId, action: "ACCESS_REVOKED", revoked: revoked.length });
+        continue;
+      }
+
+      // A session whose credential is no longer active upstream should not be
+      // alive here — this catches a DEVICE_REVOKED event that never arrived.
+      const sessions = await prisma.deskSession.findMany({
+        where: { userId, status: "ACTIVE" },
+        select: { id: true, deviceCredentialId: true },
+      });
+
+      for (const session of sessions) {
+        if (!state.state.activeCredentialIds.includes(session.deviceCredentialId)) {
+          await revokeDeskSession(session.id, "RECONCILED_CREDENTIAL_INACTIVE");
+          deskLog("RECONCILIATION", {
+            userId,
+            sessionId: session.id,
+            action: "CREDENTIAL_INACTIVE",
+          });
+        }
+      }
+    }
+  } catch {
+    // Reconciliation is best-effort; failure leaves state unchanged.
+  }
+}
+
+const EVENT_POLL_INTERVAL_MS = Number(process.env.DESK_EVENT_POLL_MS ?? 10_000);
+const RECONCILE_INTERVAL_MS = Number(process.env.DESK_RECONCILE_MS ?? 300_000);
+
+setInterval(() => void pollSecurityEvents(), EVENT_POLL_INTERVAL_MS).unref?.();
+setInterval(() => void reconcileActiveSessions(), RECONCILE_INTERVAL_MS).unref?.();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Device verification interstitial (§4, §8.1)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Served between the exchange and the session. The page asks the browser to
+// sign Website 2's own nonce with the device private key. The key is
+// non-extractable and lives in IndexedDB, so this page can use it and still
+// cannot read it.
+
+function renderDeviceVerificationScreen(returnTo = "/"): string {
+  // Only same-origin paths — never reflect an attacker-supplied absolute URL
+  // back into a redirect.
+  const safeReturn =
+    returnTo.startsWith("/") && !returnTo.startsWith("//") ? returnTo : "/";
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Verifying device — The Operations Desk</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background:#0f141f; color:#e2e8f0;
+           min-height:100vh; display:flex; align-items:center; justify-content:center; margin:0; }
+    .card { max-width: 440px; padding: 32px; border:1px solid #1e293b; border-radius:12px; background:#111827; }
+    h1 { font-size:18px; margin:0 0 12px; }
+    p { color:#94a3b8; font-size:14px; line-height:1.6; }
+    .err { color:#f87171; }
+    a { color:#60a5fa; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Verifying your device</h1>
+    <p id="status">Proving possession of your registered device credential…</p>
+    <p id="fallback" style="display:none">
+      <a href="${GATEWAY_URL}/dashboard">Return to the GateZero portal</a>
+    </p>
+  </div>
+  <script type="module">
+    const RETURN_TO = ${JSON.stringify(safeReturn)};
+    const statusEl = document.getElementById('status');
+    const fallbackEl = document.getElementById('fallback');
+
+    function fail(message) {
+      statusEl.textContent = message;
+      statusEl.className = 'err';
+      fallbackEl.style.display = 'block';
+    }
+
+    function b64u(buffer) {
+      const bytes = new Uint8Array(buffer);
+      let binary = '';
+      for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+    }
+
+    function openDb() {
+      return new Promise((resolve, reject) => {
+        const request = indexedDB.open('gatezero-device', 1);
+        request.onupgradeneeded = () => {
+          const db = request.result;
+          if (!db.objectStoreNames.contains('credentials')) db.createObjectStore('credentials');
+        };
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    }
+
+    async function loadKey() {
+      const db = await openDb();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('credentials', 'readonly');
+        const req = tx.objectStore('credentials').get('device-key');
+        req.onsuccess = () => resolve(req.result ?? null);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    (async () => {
+      try {
+        const key = await loadKey();
+        if (!key) {
+          fail('No device credential found in this browser. Enrol this device from the GateZero portal first.');
+          return;
+        }
+
+        const challengeRes = await fetch('/api/auth/device-challenge', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' }, body: '{}'
+        });
+        if (!challengeRes.ok) { fail('Device verification could not be started.'); return; }
+
+        const { nonce } = await challengeRes.json();
+
+        // The issuer is part of the signed bytes, so this signature is valid
+        // only for Website 2's checkpoint.
+        const message = new TextEncoder().encode('gatezero:v1:website-2:W2_SESSION:' + nonce);
+        const signature = await crypto.subtle.sign(
+          { name: 'ECDSA', hash: 'SHA-256' }, key.privateKey, message
+        );
+
+        // Establishment and re-verification sign the same challenge; only the
+        // endpoint differs. Try establishment first — it is a no-op for a
+        // session that already exists — then fall back to re-verification.
+        let proofRes = await fetch('/api/auth/device-proof', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nonce, signature: b64u(signature) })
+        });
+
+        if (!proofRes.ok) {
+          const retry = await fetch('/api/auth/device-challenge', {
+            method: 'POST', credentials: 'include',
+            headers: { 'Content-Type': 'application/json' }, body: '{}'
+          });
+          if (retry.ok) {
+            const again = await retry.json();
+            const sig2 = await crypto.subtle.sign(
+              { name: 'ECDSA', hash: 'SHA-256' }, key.privateKey,
+              new TextEncoder().encode('gatezero:v1:website-2:W2_SESSION:' + again.nonce)
+            );
+            proofRes = await fetch('/api/auth/device-reverify', {
+              method: 'POST', credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ nonce: again.nonce, signature: b64u(sig2) })
+            });
+          }
+        }
+
+        if (!proofRes.ok) { fail('Device verification failed.'); return; }
+
+        statusEl.textContent = 'Verified. Opening the Operations Desk…';
+        window.location.replace(RETURN_TO);
+      } catch {
+        fail('Device verification failed.');
+      }
+    })();
+  </script>
+</body>
+</html>`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. REST API Endpoints (Protected by the Website 2 Session Guard)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Overview Stats
-app.get("/api/desk/stats", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/stats", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const [activeAssignments, totalStaff, onDutyStaff, todayShifts, wireCount] = await Promise.all([
     prisma.assignment.count({ where: { status: { in: ["TODO", "IN_PROGRESS"] } } }),
     prisma.staffMember.count(),
@@ -179,14 +1069,14 @@ app.get("/api/desk/stats", requireGatewayAuth, async (req: AuthRequest, res: Res
 });
 
 // Assignments (CRUD)
-app.get("/api/desk/assignments", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/assignments", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const assignments = await prisma.assignment.findMany({
     orderBy: { createdAt: "desc" },
   });
   res.json({ assignments });
 });
 
-app.post("/api/desk/assignments", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/desk/assignments", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const { title, description, department, status, priority, assigneeName, assigneeEmail, deadline } = req.body;
   if (!title) return res.status(400).json({ error: "Title is required" });
 
@@ -209,7 +1099,7 @@ app.post("/api/desk/assignments", requireGatewayAuth, async (req: AuthRequest, r
   res.json({ success: true, assignment: item });
 });
 
-app.patch("/api/desk/assignments/:id", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.patch("/api/desk/assignments/:id", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const id = req.params.id as string;
   const { status, priority, title, description } = req.body;
 
@@ -226,14 +1116,14 @@ app.patch("/api/desk/assignments/:id", requireGatewayAuth, async (req: AuthReque
   res.json({ success: true, assignment: updated });
 });
 
-app.delete("/api/desk/assignments/:id", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.delete("/api/desk/assignments/:id", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const id = req.params.id as string;
   await prisma.assignment.delete({ where: { id } });
   res.json({ success: true });
 });
 
 // Wire Bulletins
-app.get("/api/desk/wire", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/wire", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const bulletins = await prisma.wireBulletin.findMany({
     orderBy: { createdAt: "desc" },
     take: 25,
@@ -241,7 +1131,7 @@ app.get("/api/desk/wire", requireGatewayAuth, async (req: AuthRequest, res: Resp
   res.json({ bulletins });
 });
 
-app.post("/api/desk/wire", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/desk/wire", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const { headline, body, category, urgency } = req.body;
   if (!headline) return res.status(400).json({ error: "Headline is required" });
 
@@ -262,14 +1152,14 @@ app.post("/api/desk/wire", requireGatewayAuth, async (req: AuthRequest, res: Res
 });
 
 // Staff Roster
-app.get("/api/desk/roster", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/roster", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const staff = await prisma.staffMember.findMany({
     orderBy: [{ status: "asc" }, { department: "asc" }],
   });
   res.json({ staff });
 });
 
-app.patch("/api/desk/roster/:id", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.patch("/api/desk/roster/:id", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const id = req.params.id as string;
   const { status } = req.body;
 
@@ -282,7 +1172,7 @@ app.patch("/api/desk/roster/:id", requireGatewayAuth, async (req: AuthRequest, r
 });
 
 // Ledger
-app.get("/api/desk/ledger", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/ledger", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const records = await prisma.ledgerRecord.findMany({
     orderBy: { entryDate: "desc" },
   });
@@ -300,7 +1190,7 @@ app.get("/api/desk/ledger", requireGatewayAuth, async (req: AuthRequest, res: Re
   });
 });
 
-app.post("/api/desk/ledger", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/desk/ledger", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const { description, category, amount, type } = req.body;
   if (!description || !amount) return res.status(400).json({ error: "Description and amount required" });
 
@@ -324,7 +1214,7 @@ app.post("/api/desk/ledger", requireGatewayAuth, async (req: AuthRequest, res: R
 });
 
 // Archive
-app.get("/api/desk/archive", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/archive", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const { department, search } = req.query as { department?: string; search?: string };
 
   const records = await prisma.archiveRecord.findMany({
@@ -344,7 +1234,7 @@ app.get("/api/desk/archive", requireGatewayAuth, async (req: AuthRequest, res: R
   res.json({ records });
 });
 
-app.post("/api/desk/archive", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/desk/archive", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const { title, department, summary, tags } = req.body;
   if (!title) return res.status(400).json({ error: "Title required" });
 
@@ -368,14 +1258,14 @@ app.post("/api/desk/archive", requireGatewayAuth, async (req: AuthRequest, res: 
 });
 
 // Messages
-app.get("/api/desk/messages", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/messages", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const messages = await prisma.deskMessage.findMany({
     orderBy: { createdAt: "desc" },
   });
   res.json({ messages });
 });
 
-app.post("/api/desk/messages", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.post("/api/desk/messages", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const { subject, content, urgent, recipientEmail } = req.body;
   if (!subject || !content) return res.status(400).json({ error: "Subject and content required" });
 
@@ -395,7 +1285,7 @@ app.post("/api/desk/messages", requireGatewayAuth, async (req: AuthRequest, res:
 });
 
 // Calendar
-app.get("/api/desk/calendar", requireGatewayAuth, async (req: AuthRequest, res: Response) => {
+app.get("/api/desk/calendar", requireDeskSession, async (req: AuthRequest, res: Response) => {
   const shifts = await prisma.calendarShift.findMany({
     orderBy: [{ date: "asc" }, { startTime: "asc" }],
   });
@@ -403,14 +1293,14 @@ app.get("/api/desk/calendar", requireGatewayAuth, async (req: AuthRequest, res: 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 4. Main HTML Page (Tactile Paper-and-Ink Interface)
+// 9. Main HTML Page (Tactile Paper-and-Ink Interface)
 // ─────────────────────────────────────────────────────────────────────────────
-app.get("/", requireGatewayAuth, (req: AuthRequest, res: Response) => {
+app.get("/", requireDeskSession, (req: AuthRequest, res: Response) => {
   res.send(renderOperationsDeskApp(req.user));
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. Neutral Gateway Intercept Screen Template
+// 10. Neutral Gateway Intercept Screen Template
 // ─────────────────────────────────────────────────────────────────────────────
 function renderNeutralInterceptScreen(reason: string) {
   return `<!DOCTYPE html>
@@ -483,7 +1373,7 @@ function renderNeutralInterceptScreen(reason: string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 6. Complete Tactile Operations Desk Frontend Interface Template
+// 11. Complete Tactile Operations Desk Frontend Interface Template
 // ─────────────────────────────────────────────────────────────────────────────
 function renderOperationsDeskApp(user?: { name: string; email: string; role: string }) {
   return `<!DOCTYPE html>
@@ -564,6 +1454,97 @@ function renderOperationsDeskApp(user?: { name: string; email: string; role: str
   </style>
 </head>
 <body class="paper-desk font-body min-h-screen flex flex-col antialiased selection:bg-accent-brass selection:text-white">
+
+  <script>
+  /*
+   * website-2-defense.md §14 — transparent device re-verification.
+   *
+   * The Session Guard refuses a request whose device proof has gone stale,
+   * answering 401 DEVICE_REVERIFICATION_REQUIRED. Rather than teaching every
+   * call site about that, fetch is wrapped once here: on that specific answer
+   * the page re-signs a fresh Website 2 challenge with the non-extractable
+   * device key and replays the original request.
+   *
+   * The employee sees nothing. Someone holding only a stolen session cookie
+   * cannot produce the signature and simply stops working — which is the point
+   * of §14: the identifier alone is never sufficient.
+   *
+   * Concurrent 401s share one in-flight re-verification, so a burst of parallel
+   * requests does not start a burst of parallel signings.
+   */
+  (function () {
+    var originalFetch = window.fetch.bind(window);
+    var inFlight = null;
+
+    function b64u(buffer) {
+      var bytes = new Uint8Array(buffer), binary = '';
+      for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function loadKey() {
+      return new Promise(function (resolve, reject) {
+        var open = indexedDB.open('gatezero-device', 1);
+        open.onupgradeneeded = function () {
+          var db = open.result;
+          if (!db.objectStoreNames.contains('credentials')) db.createObjectStore('credentials');
+        };
+        open.onsuccess = function () {
+          var tx = open.result.transaction('credentials', 'readonly');
+          var req = tx.objectStore('credentials').get('device-key');
+          req.onsuccess = function () { resolve(req.result || null); };
+          req.onerror = function () { reject(req.error); };
+        };
+        open.onerror = function () { reject(open.error); };
+      });
+    }
+
+    function reverify() {
+      if (inFlight) return inFlight;
+
+      inFlight = (async function () {
+        var key = await loadKey();
+        if (!key) return false;
+
+        var challengeRes = await originalFetch('/api/auth/device-challenge', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' }, body: '{}'
+        });
+        if (!challengeRes.ok) return false;
+
+        var challenge = await challengeRes.json();
+        var signature = await crypto.subtle.sign(
+          { name: 'ECDSA', hash: 'SHA-256' }, key.privateKey,
+          new TextEncoder().encode('gatezero:v1:website-2:W2_SESSION:' + challenge.nonce)
+        );
+
+        var proofRes = await originalFetch('/api/auth/device-reverify', {
+          method: 'POST', credentials: 'include',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nonce: challenge.nonce, signature: b64u(signature) })
+        });
+        return proofRes.ok;
+      })().finally(function () { inFlight = null; });
+
+      return inFlight;
+    }
+
+    window.fetch = async function (input, init) {
+      var res = await originalFetch(input, init);
+      if (res.status !== 401) return res;
+
+      // Only act on this one signal; every other 401 is a real denial.
+      var body = await res.clone().json().catch(function () { return null; });
+      if (!body || body.error !== 'DEVICE_REVERIFICATION_REQUIRED') return res;
+
+      var ok = await reverify().catch(function () { return false; });
+      if (!ok) { window.location.reload(); return res; }
+
+      return originalFetch(input, init);
+    };
+  })();
+  </script>
+
 
   <!-- MASTHEAD & TOP NAVIGATION -->
   <header class="bg-paper-base dark:bg-night-base border-b-[3px] border-ink-primary dark:border-night-ink sticky top-0 z-40">
@@ -1500,7 +2481,7 @@ app.listen(PORT, HOST, () => {
   console.log(` 📰 THE OPERATIONS DESK (WEBSITE 2) ACTIVE`);
   console.log(` URL: http://${HOST}:${PORT}`);
   console.log(` Gated by GateZero Gateway: ${GATEWAY_URL}`);
-  console.log(` Live Per-Request Introspection: ACTIVE`);
+  console.log(` Session Guard: ACTIVE (independent of Website 1 / Gateway)`);
   console.log(` Security Headers: ENFORCED`);
   console.log(`=======================================================\n`);
 });

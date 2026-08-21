@@ -1,30 +1,58 @@
 /**
  * app/api/connect/route.ts
  * ─────────────────────────────────────────────────────────────────────────────
- * Connect Endpoint — the core of the explicit access grant flow
+ * CONNECT — the explicit, security-sensitive access request
+ * website-1-defense.md §4, §5, §7, §8, §10, §19
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * POST /api/connect
+ * A valid 7-day Website 1 session does not authorize Website 2 (§4). The
+ * employee must click Connect, and every click runs the full checkpoint:
  *
- * What it does:
- *   (a) Verifies the 7-day session is currently valid (ACTIVE, not expired/revoked)
- *   (b) Checks rate limiting (sliding window, per user+IP)
- *   (c) Calls the mock Authorization Service to issue a short-lived token
- *   (d) Logs the event to the CONNECT audit stream
- *   (e) Returns status and expiry to the frontend (NOT the token itself)
+ *   1. Valid Website 1 session
+ *   2. CSRF (§10) — before anything stateful is touched
+ *   3. Cooldown from prior repeated failures (§10)
+ *   4. Pending MFA step-up gate (§7 MEDIUM, §15 override)
+ *   5. Rate limit (§10)
+ *   6. Cryptographic device proof (§8) — authoritative device identity
+ *   7. Mini EDR risk assessment (§5, §6, §7)
+ *   8. Authorization Service issues a fresh 5-minute, one-time, device-bound
+ *      grant (§8)
  *
- * The authorization token is NEVER sent to the browser.
- * The frontend receives only the tokenId (a DB record ID) and expiry time,
- * which it uses to check gateway access via /api/internal.
+ * Website 1 never contacts Website 2 or the Gateway here, and never learns
+ * Website 2's location (§4). It requests an authorization; that is the whole of
+ * its role.
+ *
+ * The response carries the opaque token id and expiry — never the grant itself.
  */
 
 import { NextRequest, NextResponse } from "next/server";
-import { getValidSession, flagStepUpRequired, revokeSession, getIronSessionStore } from "@/lib/auth/session";
-import { issueAuthorization, getActiveAuthorization, revokeAuthorization } from "@/lib/authz-service";
+import { z } from "zod";
+import {
+  getValidSession,
+  flagStepUpRequired,
+  revokeSession,
+  getIronSessionStore,
+  applyConnectCooldown,
+  connectCooldownRemainingMs,
+  bindSessionDevice,
+} from "@/lib/auth/session";
+import {
+  issueAuthorization,
+  getActiveAuthorization,
+  revokeAuthorization,
+} from "@/lib/authz-service";
 import { checkRateLimit, connectRateLimitKey } from "@/lib/rate-limit";
 import { CSRF_HEADER, verifyCsrfToken } from "@/lib/auth/csrf";
 import { auditConnect, getClientIP, getClientUA } from "@/lib/audit";
-import { assessConnectRisk } from "@/lib/mini-edr";
+import { assessConnectRisk, type DeviceContext } from "@/lib/mini-edr";
+import { verifyDeviceProof } from "@/lib/device";
+import { raiseSecurityAlert } from "@/lib/alerts";
+import { notifyEmployee } from "@/lib/notify";
+import { prisma } from "@/lib/db";
+import {
+  CONNECT_FAILURE_THRESHOLD,
+  CONNECT_FAILURE_WINDOW_SECONDS,
+} from "@/lib/config";
 import {
   unauthorized,
   forbidden,
@@ -33,12 +61,72 @@ import {
   safeHandler,
 } from "@/lib/errors";
 
+/** §8: a Connect request without a device proof cannot produce a bound grant. */
+const connectSchema = z.object({
+  nonce: z.string().min(16),
+  signature: z.string().min(16),
+});
+
+/**
+ * §10: count recent Connect denials for this employee.
+ *
+ * Counts denials rather than attempts: an employee who connects successfully
+ * ten times has done nothing wrong, while ten refusals is a pattern worth
+ * freezing and telling them about.
+ */
+async function recentConnectFailures(userId: string): Promise<number> {
+  const since = new Date(Date.now() - CONNECT_FAILURE_WINDOW_SECONDS * 1000);
+  return prisma.auditLog.count({
+    where: {
+      userId,
+      stream: "CONNECT",
+      outcome: "DENIED",
+      createdAt: { gte: since },
+    },
+  });
+}
+
+/**
+ * Apply the cooldown and notify the employee once the failure threshold trips.
+ *
+ * §10 requires all three responses: the cooldown, the log entry, and a
+ * notification to the employee that is independent of any admin-facing alert —
+ * the person whose account it is should hear about it even when nothing rises
+ * to an operator page.
+ */
+async function escalateFailures(params: {
+  session: Awaited<ReturnType<typeof getValidSession>>;
+  ip: string;
+  ua: string;
+}): Promise<void> {
+  const session = params.session;
+  if (!session) return;
+
+  const failures = await recentConnectFailures(session.userId);
+  if (failures < CONNECT_FAILURE_THRESHOLD) return;
+
+  const until = await applyConnectCooldown(session.id);
+
+  await auditConnect({
+    eventType: "CONNECT_COOLDOWN_APPLIED",
+    userId: session.userId,
+    sessionId: session.id,
+    ipAddress: params.ip,
+    userAgent: params.ua,
+    outcome: "DENIED",
+    severity: "HIGH",
+    metadata: { failures, cooldownUntil: until.toISOString() },
+  });
+
+  void notifyEmployee(session.user, "CONNECT_COOLDOWN");
+}
+
 export async function POST(request: NextRequest): Promise<NextResponse> {
   return safeHandler(async () => {
     const ip = getClientIP(request);
     const ua = getClientUA(request);
 
-    // (a) Verify session
+    // ── 1. Valid Website 1 session ──────────────────────────────────────────
     const session = await getValidSession();
     if (!session) {
       void auditConnect({
@@ -51,11 +139,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return unauthorized("Valid session required to connect");
     }
 
-    // (a.5) CSRF check — Connect is a security-sensitive, state-changing action.
-    // Reject before touching rate limiting or the Authorization Service so a
-    // forged cross-site request never even consumes a rate-limit slot.
-    const csrfToken = request.headers.get(CSRF_HEADER);
-    if (!verifyCsrfToken(session.id, csrfToken)) {
+    // ── 2. CSRF ─────────────────────────────────────────────────────────────
+    // Rejected before rate limiting or the Authorization Service, so a forged
+    // cross-site request never consumes a rate-limit slot on the employee's
+    // behalf.
+    if (!verifyCsrfToken(session.id, request.headers.get(CSRF_HEADER))) {
       void auditConnect({
         eventType: "CONNECT_DENIED_CSRF",
         userId: session.userId,
@@ -68,11 +156,26 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return forbidden("Missing or invalid CSRF token");
     }
 
-    // (a.6) Mini EDR step-up gate — a prior MEDIUM-risk assessment blocked
-    // Connect until fresh MFA is completed via /api/auth/step-up. The
-    // session itself stays ACTIVE (not revoked); this only gates Connect.
-    // Checked before rate limiting so a gated user doesn't burn rate-limit
-    // slots retrying Connect instead of completing step-up.
+    // ── 3. Cooldown from prior repeated failures (§10) ──────────────────────
+    const cooldownMs = connectCooldownRemainingMs(session);
+    if (cooldownMs > 0) {
+      void auditConnect({
+        eventType: "CONNECT_DENIED_COOLDOWN",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: { remainingSeconds: Math.ceil(cooldownMs / 1000) },
+      });
+      return tooManyRequests(new Date(Date.now() + cooldownMs));
+    }
+
+    // ── 4. Pending MFA step-up gate ─────────────────────────────────────────
+    // Set by a prior MEDIUM-risk assessment (§7) or by an administrative MFA
+    // override (§15). The Website 1 session stays ACTIVE — only Connect is
+    // gated. Checked before rate limiting so a gated employee spends their
+    // attempts on step-up rather than on doomed retries.
     if (session.connectStepUpRequired) {
       void auditConnect({
         eventType: "CONNECT_DENIED_STEP_UP_REQUIRED",
@@ -81,7 +184,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         ipAddress: ip,
         userAgent: ua,
         outcome: "DENIED",
-        metadata: {},
+        metadata: { mfaOverridden: session.mfaOverridden },
       });
       return forbidden(
         "Fresh MFA verification required before connecting",
@@ -89,10 +192,23 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // (b) Rate limiting — per user + per IP (sliding window)
-    const rateLimitKey = connectRateLimitKey(session.userId, ip);
-    const rateCheck = await checkRateLimit(rateLimitKey);
+    // W2 §22: an administratively revoked employee cannot obtain authorization.
+    if (session.user.accessRevoked) {
+      void auditConnect({
+        eventType: "CONNECT_DENIED_ACCESS_REVOKED",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        severity: "HIGH",
+        metadata: {},
+      });
+      return forbidden("Access has been revoked", "ACCESS_REVOKED");
+    }
 
+    // ── 5. Rate limiting (§10) ──────────────────────────────────────────────
+    const rateCheck = await checkRateLimit(connectRateLimitKey(session.userId, ip));
     if (!rateCheck.allowed) {
       void auditConnect({
         eventType: "CONNECT_RATE_LIMITED",
@@ -103,15 +219,54 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         outcome: "DENIED",
         metadata: { resetAt: rateCheck.resetAt },
       });
+      await escalateFailures({ session, ip, ua });
       return tooManyRequests(rateCheck.resetAt);
     }
 
-    // (b.5) Mini EDR — risk assessment (§6-7)
-    const assessment = await assessConnectRisk(session, ip, ua);
+    // ── 6. Cryptographic device proof (§8) ──────────────────────────────────
+    const body = await request.json().catch(() => null);
+    const parsed = connectSchema.safeParse(body);
+
+    if (!parsed.success) {
+      void auditConnect({
+        eventType: "CONNECT_DENIED_NO_DEVICE_PROOF",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        metadata: {},
+      });
+      return forbidden(
+        "A registered device is required to connect",
+        "DEVICE_PROOF_REQUIRED"
+      );
+    }
+
+    const proofResult = await verifyDeviceProof({
+      userId: session.userId,
+      proof: { nonce: parsed.data.nonce, signature: parsed.data.signature },
+      purpose: "CONNECT",
+      issuer: "website-1",
+    });
+
+    const deviceContext: DeviceContext = {
+      proofValid: proofResult.valid,
+      credentialId: proofResult.credential?.id,
+      reason: proofResult.reason,
+      previousCredentialId: session.deviceCredentialId,
+    };
+
+    // ── 7. Mini EDR risk assessment (§5-§7) ─────────────────────────────────
+    // A failed device proof is scored rather than short-circuited: §7 defines
+    // graded responses, and the assessment decides whether this is a
+    // step-up situation or a terminate-and-alert one.
+    const assessment = await assessConnectRisk(session, ip, ua, deviceContext);
 
     if (assessment.level === "MEDIUM") {
-      // Block Connect and require fresh MFA. The 7-day W1 session is left
-      // untouched — only the Connect endpoint is gated.
+      // Block Connect and require fresh MFA. The 7-day session is untouched —
+      // only the Connect endpoint is gated, so the employee keeps their portal
+      // session and simply has to re-prove themselves before connecting.
       await flagStepUpRequired(session.id);
       void auditConnect({
         eventType: "CONNECT_BLOCKED_MEDIUM_RISK",
@@ -120,8 +275,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         ipAddress: ip,
         userAgent: ua,
         outcome: "DENIED",
-        metadata: { score: assessment.score, factors: assessment.factors },
+        severity: "WARNING",
+        metadata: {
+          score: assessment.score,
+          factors: assessment.factors,
+          reason: "Significant session/device change detected",
+          action: "Step-up MFA required; Website 1 session retained",
+          gatewayAuthorization: "Not issued",
+        },
       });
+      await escalateFailures({ session, ip, ua });
       return forbidden(
         "Fresh MFA verification required before connecting",
         "STEP_UP_MFA_REQUIRED"
@@ -129,16 +292,14 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     }
 
     if (assessment.level === "HIGH" || assessment.level === "CRITICAL") {
-      // HIGH/CRITICAL terminate the W1 session outright (approved to revoke,
-      // unlike MEDIUM) and, for CRITICAL, also revoke any active
-      // authorization token so Website 2 access is cut immediately.
+      // §7: terminate the Website 1 session and require fresh SSO + MFA.
+      // CRITICAL additionally revokes any outstanding authorization so Website 2
+      // access is cut immediately rather than at the end of its 5 minutes.
       await revokeSession(session.id);
 
       if (assessment.level === "CRITICAL") {
         const activeToken = await getActiveAuthorization(session.id);
-        if (activeToken) {
-          await revokeAuthorization(activeToken.tokenId);
-        }
+        if (activeToken) await revokeAuthorization(activeToken.tokenId);
       }
 
       const ironSession = await getIronSessionStore();
@@ -155,21 +316,30 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         ipAddress: ip,
         userAgent: ua,
         outcome: "DENIED",
-        metadata: { score: assessment.score, factors: assessment.factors },
+        severity: assessment.level,
+        metadata: {
+          score: assessment.score,
+          factors: assessment.factors,
+          failedClosed: assessment.failedClosed ?? false,
+          reason: "Significant session/device change detected",
+          action: "Website 1 session terminated",
+          gatewayAuthorization: "Not issued",
+        },
       });
 
-      // Security alert — implemented as a distinguishable, severity-tagged
-      // audit entry for now. Real external dispatch (email/Slack/pager) is
-      // a named stub, not built in this pass.
-      void auditConnect({
-        eventType: "SECURITY_ALERT",
+      // §20: deduplicated and severity-gated, so a repeating detection does not
+      // page an operator every few seconds.
+      void raiseSecurityAlert({
+        alertKey: `connect_risk:${assessment.level}`,
+        severity: assessment.level,
         userId: session.userId,
         sessionId: session.id,
         ipAddress: ip,
         userAgent: ua,
-        outcome: "DENIED",
-        metadata: { severity: assessment.level, score: assessment.score, factors: assessment.factors },
+        metadata: { score: assessment.score, factors: assessment.factors },
       });
+
+      void notifyEmployee(session.user, "SESSION_TERMINATED_RISK");
 
       return unauthorized(
         "Session terminated due to elevated risk — please sign in again",
@@ -177,7 +347,29 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       );
     }
 
-    // (c) Call Authorization Service
+    // Below MEDIUM, a device proof is still mandatory. Reaching here without a
+    // valid one would mean the scoring weights had drifted far enough to let an
+    // unbound grant through, so this is a hard backstop rather than a branch we
+    // expect to hit.
+    if (!proofResult.valid || !proofResult.credential) {
+      void auditConnect({
+        eventType: "CONNECT_DENIED_DEVICE_PROOF_INVALID",
+        userId: session.userId,
+        sessionId: session.id,
+        ipAddress: ip,
+        userAgent: ua,
+        outcome: "DENIED",
+        severity: "HIGH",
+        metadata: { reason: proofResult.reason, score: assessment.score },
+      });
+      await escalateFailures({ session, ip, ua });
+      return forbidden(
+        "A registered device is required to connect",
+        "DEVICE_PROOF_REQUIRED"
+      );
+    }
+
+    // ── 8. Fresh 5-minute, one-time, device-bound authorization (§8) ────────
     let authResult: Awaited<ReturnType<typeof issueAuthorization>>;
     try {
       authResult = await issueAuthorization({
@@ -185,6 +377,9 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         userId: session.userId,
         ipAddress: ip,
         userAgent: ua,
+        deviceCredentialId: proofResult.credential.id,
+        bindingNonce: parsed.data.nonce,
+        targetApp: "operations-desk",
       });
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -196,16 +391,24 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
         ipAddress: ip,
         userAgent: ua,
         outcome: "DENIED",
+        severity: "WARNING",
         metadata: { reason: errMsg },
       });
+      await escalateFailures({ session, ip, ua });
 
       if (errMsg === "SESSION_INVALID") {
         return unauthorized("Session is no longer valid");
       }
+      if (errMsg === "ACCESS_REVOKED") {
+        return forbidden("Access has been revoked", "ACCESS_REVOKED");
+      }
+      // §19: fail closed. The Authorization Service being unreachable or
+      // erroring denies Connect — it never implies authorization.
       return serverError("Authorization service error", err);
     }
 
-    // (d) Audit log — success
+    await bindSessionDevice(session.id, proofResult.credential.id);
+
     void auditConnect({
       eventType: "CONNECT_GRANTED",
       userId: session.userId,
@@ -217,13 +420,16 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       metadata: {
         expiresAt: authResult.expiresAt,
         ttlSeconds: authResult.ttlSeconds,
+        deviceCredentialId: proofResult.credential.id,
+        riskLevel: assessment.level,
+        riskScore: assessment.score,
       },
     });
 
-    // (e) Return status to frontend — NOT the token itself
+    // The grant itself never reaches the browser — only its opaque id.
     return NextResponse.json({
       granted: true,
-      tokenId: authResult.tokenId,         // opaque ID for gateway lookup
+      tokenId: authResult.tokenId,
       expiresAt: authResult.expiresAt,
       ttlSeconds: authResult.ttlSeconds,
       rateLimitRemaining: rateCheck.remaining,

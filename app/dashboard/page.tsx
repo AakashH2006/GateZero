@@ -2,11 +2,36 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import {
+  createDeviceKey,
+  getDeviceKey,
+  signChallenge,
+  detectHardwareBacking,
+} from "@/lib/device/client";
+
+interface DeviceState {
+  registered: boolean;
+  credentialId?: string;
+  label?: string;
+  assurance?: string;
+  hardwareBacked?: boolean;
+  usable?: boolean;
+  rotationDue?: boolean;
+  pendingApproval?: { id: string; label: string } | null;
+}
 
 interface SessionState {
   authenticated: boolean;
-  user?: { name: string; email: string; role: string };
-  session?: { id: string; expiresAt: string; createdAt: string };
+  user?: { name: string; email: string; role: string; accessRevoked?: boolean };
+  session?: {
+    id: string;
+    expiresAt: string;
+    createdAt: string;
+    stepUpRequired?: boolean;
+    mfaOverridden?: boolean;
+    connectCooldownSeconds?: number;
+  };
+  device?: DeviceState;
   authorization?: {
     active: boolean;
     tokenId?: string;
@@ -35,6 +60,10 @@ export default function DashboardPage() {
   const [auditLogs, setAuditLogs] = useState<AuditEntry[]>([]);
   const [time, setTime] = useState("");
   const [sessionTimeLeft, setSessionTimeLeft] = useState("");
+  const [isEnrolling, setIsEnrolling] = useState(false);
+  const [deviceNotice, setDeviceNotice] = useState<string | null>(null);
+  const [stepUpCode, setStepUpCode] = useState("");
+  const [stepUpBusy, setStepUpBusy] = useState(false);
 
   // Live ZULU clock
   useEffect(() => {
@@ -102,21 +131,120 @@ export default function DashboardPage() {
 
   useEffect(() => { fetchLogs(); }, [fetchLogs]);
 
+  // Device enrolment (website-2-defense.md 4, 6)
+  //
+  // The private key is generated here with extractable:false and stored in
+  // IndexedDB. It never leaves the browser - not to this page, not to the
+  // server. What is sent is the public key plus a signature over the server's
+  // own challenge, which proves the device actually holds the private half.
+  const handleEnrolDevice = async () => {
+    setIsEnrolling(true);
+    setDeviceNotice(null);
+    setConnectError(null);
+    try {
+      const key = await createDeviceKey();
+
+      const challengeRes = await fetch("/api/device/challenge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ purpose: "REGISTRATION" }),
+      });
+      if (!challengeRes.ok) {
+        setConnectError("COULD NOT START DEVICE ENROLMENT");
+        return;
+      }
+      const { nonce } = await challengeRes.json();
+      const signature = await signChallenge(key, "website-1", "REGISTRATION", nonce);
+
+      const res = await fetch("/api/device", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.csrfToken ? { "x-csrf-token": session.csrfToken } : {}),
+        },
+        body: JSON.stringify({
+          label: (navigator.platform || "BROWSER") + " " + new Date().toISOString().slice(0, 10),
+          publicKeySpki: key.publicKeySpki,
+          hardwareBacked: await detectHardwareBacking(),
+          nonce,
+          signature,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setConnectError(data.error ?? "DEVICE ENROLMENT REFUSED");
+        return;
+      }
+
+      setDeviceNotice(
+        data.status === "ACTIVE"
+          ? "DEVICE ENROLLED AND ACTIVE."
+          : "DEVICE ENROLLED. AWAITING ADMINISTRATOR APPROVAL."
+      );
+      await fetchSession();
+    } catch {
+      setConnectError("DEVICE ENROLMENT FAILED IN THIS BROWSER");
+    } finally {
+      setIsEnrolling(false);
+    }
+  };
+
+  // Connect (website-1-defense.md 4, 8)
+  //
+  // Connect now carries a device proof. The nonce is fetched fresh from the
+  // server and signed with the non-extractable device key, so a Connect request
+  // cannot be replayed and cannot be issued by a browser that merely holds a
+  // stolen session cookie.
   const handleConnect = async () => {
     setIsConnecting(true);
     setConnectError(null);
     try {
+      const key = await getDeviceKey();
+      if (!key) {
+        setConnectError("NO DEVICE CREDENTIAL IN THIS BROWSER - ENROL THIS DEVICE FIRST");
+        return;
+      }
+
+      const challengeRes = await fetch("/api/device/challenge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ purpose: "CONNECT" }),
+      });
+      if (!challengeRes.ok) {
+        setConnectError("COULD NOT OBTAIN A DEVICE CHALLENGE");
+        return;
+      }
+      const { nonce } = await challengeRes.json();
+      const signature = await signChallenge(key, "website-1", "CONNECT", nonce);
+
       const res = await fetch("/api/connect", {
         method: "POST",
-        headers: session?.csrfToken ? { "x-csrf-token": session.csrfToken } : {},
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.csrfToken ? { "x-csrf-token": session.csrfToken } : {}),
+        },
+        body: JSON.stringify({ nonce, signature }),
       });
       const data = await res.json();
+
+      if (res.status === 401 && data.code === "SESSION_TERMINATED_RISK") {
+        router.replace("/");
+        return;
+      }
+      if (res.status === 403 && data.code === "STEP_UP_MFA_REQUIRED") {
+        setConnectError("FRESH MFA REQUIRED - COMPLETE STEP-UP BELOW");
+        await fetchSession();
+        return;
+      }
       if (res.status === 403) {
-        setConnectError("SECURITY CHECK FAILED. REFRESH AND TRY AGAIN.");
+        setConnectError(data.error ?? "SECURITY CHECK FAILED");
+        await fetchSession();
         return;
       }
       if (res.status === 429) {
-        setConnectError("RATE LIMIT EXCEEDED. TRY AGAIN LATER.");
+        setConnectError("RATE LIMITED OR IN COOLDOWN. TRY AGAIN LATER.");
+        await fetchSession();
         return;
       }
       if (!res.ok) {
@@ -129,9 +257,51 @@ export default function DashboardPage() {
         await fetchLogs();
       }
     } catch {
-      setConnectError("CONNECTION FAILED — CHECK SYSTEM STATUS");
+      setConnectError("CONNECTION FAILED - CHECK SYSTEM STATUS");
     } finally {
       setIsConnecting(false);
+    }
+  };
+
+  // Step-up MFA (7 MEDIUM risk, 15 override)
+  const handleStepUpSend = async () => {
+    setStepUpBusy(true);
+    setConnectError(null);
+    try {
+      await fetch("/api/auth/step-up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "send" }),
+      });
+      setDeviceNotice("VERIFICATION CODE SENT TO YOUR REGISTERED EMAIL.");
+    } catch {
+      setConnectError("COULD NOT SEND VERIFICATION CODE");
+    } finally {
+      setStepUpBusy(false);
+    }
+  };
+
+  const handleStepUpVerify = async () => {
+    setStepUpBusy(true);
+    setConnectError(null);
+    try {
+      const res = await fetch("/api/auth/step-up", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: stepUpCode }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        setConnectError(data.error ?? "VERIFICATION FAILED");
+        return;
+      }
+      setStepUpCode("");
+      setDeviceNotice("VERIFIED. CONNECT IS AVAILABLE AGAIN.");
+      await fetchSession();
+    } catch {
+      setConnectError("VERIFICATION FAILED");
+    } finally {
+      setStepUpBusy(false);
     }
   };
 
@@ -141,7 +311,10 @@ export default function DashboardPage() {
     try {
       const res = await fetch("/api/authz/code", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(session?.csrfToken ? { "x-csrf-token": session.csrfToken } : {}),
+        },
         body: JSON.stringify({ targetApp: "operations-desk" }),
       });
       const data = await res.json();
@@ -163,6 +336,9 @@ export default function DashboardPage() {
   };
 
   const isAuthorized = session?.authorization?.active && countdown > 0;
+  const device = session?.device;
+  const stepUpRequired = Boolean(session?.session?.stepUpRequired);
+  const cooldownSeconds = session?.session?.connectCooldownSeconds ?? 0;
   const formatCountdown = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
@@ -280,6 +456,105 @@ export default function DashboardPage() {
                 <div className="font-data-mono text-sm text-primary">{session.user?.role}</div>
               </div>
 
+              {/* Device credential state (website-1-defense.md 8) */}
+              <div className="border border-outline-variant p-3 flex flex-col gap-2">
+                <div className="font-status-code text-xs text-on-surface-variant">
+                  DEVICE CREDENTIAL
+                </div>
+
+                {device?.registered ? (
+                  <>
+                    <div className="font-data-mono text-sm text-primary break-all">
+                      {device.label}
+                    </div>
+                    <div className="font-status-code text-[11px] text-on-surface-variant">
+                      ASSURANCE: {device.assurance}
+                      {device.hardwareBacked ? " // HARDWARE-BACKED" : " // SOFTWARE-PROTECTED"}
+                    </div>
+                    {device.rotationDue && (
+                      <div className="font-status-code text-[11px] text-amber-400">
+                        ROTATION DUE - RE-ATTEST BEFORE THE GRACE PERIOD ENDS
+                      </div>
+                    )}
+                    {!device.usable && (
+                      <div className="font-status-code text-[11px] text-error">
+                        CREDENTIAL NOT USABLE - CONNECT WILL BE REFUSED
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="font-data-mono text-sm text-error">NOT ENROLLED</div>
+                    <p className="font-status-code text-[11px] text-on-surface-variant/70">
+                      A device key is required before Connect can issue an authorization.
+                      The private key is generated in this browser and never leaves it.
+                    </p>
+                    {device?.pendingApproval && (
+                      <div className="font-status-code text-[11px] text-amber-400">
+                        AWAITING ADMINISTRATOR APPROVAL
+                      </div>
+                    )}
+                    <button
+                      onClick={handleEnrolDevice}
+                      disabled={isEnrolling}
+                      className="w-full h-9 border border-primary/50 bg-graphite hover:bg-primary/10 transition-colors text-primary font-data-mono text-xs tracking-widest disabled:opacity-50"
+                    >
+                      {isEnrolling ? "ENROLLING..." : "[ENROL THIS DEVICE]"}
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {/* Step-up MFA gate (7 MEDIUM risk, 15 override) */}
+              {stepUpRequired && (
+                <div className="border border-amber-500/50 bg-amber-500/5 p-3 flex flex-col gap-2">
+                  <div className="font-status-code text-xs text-amber-400">
+                    FRESH MFA REQUIRED BEFORE CONNECT
+                  </div>
+                  <p className="font-status-code text-[11px] text-on-surface-variant/70">
+                    {session.session?.mfaOverridden
+                      ? "This session was created through an administrative MFA override."
+                      : "A security check flagged this session."}{" "}
+                    Your portal session is still active - only Connect is gated.
+                  </p>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={handleStepUpSend}
+                      disabled={stepUpBusy}
+                      className="flex-1 h-9 border border-amber-500/50 text-amber-300 font-data-mono text-xs tracking-widest disabled:opacity-50"
+                    >
+                      [SEND CODE]
+                    </button>
+                    <input
+                      value={stepUpCode}
+                      onChange={(e) => setStepUpCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                      placeholder="000000"
+                      inputMode="numeric"
+                      className="w-24 h-9 bg-graphite border border-outline-variant text-primary font-data-mono text-sm text-center tracking-widest"
+                    />
+                    <button
+                      onClick={handleStepUpVerify}
+                      disabled={stepUpBusy || stepUpCode.length !== 6}
+                      className="flex-1 h-9 border border-primary/50 text-primary font-data-mono text-xs tracking-widest disabled:opacity-50"
+                    >
+                      [VERIFY]
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {cooldownSeconds > 0 && (
+                <div className="p-2 border border-error/50 bg-error/5 text-error font-status-code text-xs">
+                  &gt; CONNECT COOLDOWN ACTIVE: {cooldownSeconds}S REMAINING
+                </div>
+              )}
+
+              {deviceNotice && (
+                <div className="p-2 border border-primary/40 bg-primary/5 text-primary font-status-code text-xs">
+                  &gt; {deviceNotice}
+                </div>
+              )}
+
               {/* Launch Website 2 Button */}
               <button
                 onClick={handleLaunchOperationsDesk}
@@ -292,11 +567,13 @@ export default function DashboardPage() {
               {/* Connect button for barrier simulation */}
               <button
                 onClick={handleConnect}
-                disabled={isConnecting}
+                disabled={
+                  isConnecting || !device?.usable || stepUpRequired || cooldownSeconds > 0
+                }
                 className="w-full h-10 border border-primary/50 bg-graphite hover:bg-primary/10 transition-colors text-primary font-data-mono text-xs tracking-widest relative overflow-hidden group disabled:opacity-50"
               >
                 <span className="relative z-10">
-                  {isConnecting ? "REQUESTING..." : "[SIMULATE BARRIER PASS]"}
+                  {isConnecting ? "REQUESTING..." : "[CONNECT - REQUEST AUTHORIZATION]"}
                 </span>
                 <div className="absolute bottom-0 left-0 w-full h-[2px] bg-primary scale-x-0 group-hover:scale-x-100 transition-transform origin-left" />
               </button>
@@ -309,7 +586,7 @@ export default function DashboardPage() {
 
               {/* Revocation info */}
               <p className="font-status-code text-[11px] text-on-surface-variant/60">
-                GATEZERO TOKEN TTL: 5M // PER-REQUEST INTROSPECTION ENFORCED
+                AUTHORIZATION: 5M // ONE-TIME // DEVICE-BOUND
               </p>
             </div>
           </div>

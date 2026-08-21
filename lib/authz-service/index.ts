@@ -1,21 +1,50 @@
 /**
  * lib/authz-service/index.ts
  * ─────────────────────────────────────────────────────────────────────────────
- * AUTHORIZATION & GATEWAY SERVICE
+ * AUTHORIZATION SERVICE
+ * website-1-defense.md §8, §9, §16 / website-2-defense.md §3, §15, §24
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Provides:
- *   1. Single-use Authorization Exchange Codes (60s TTL) for OIDC-style handshakes
- *   2. Token issuance bound to session and device fingerprint
- *   3. Live token introspection / verification on every request (instant revocation)
- *   4. Token revocation support
+ * The Authorization Service is the only component that decides whether access
+ * to Website 2 may be granted, and the only one that mints Gateway
+ * authorizations. Website 1 asks; it does not decide, and it never learns where
+ * Website 2 lives (W1 §4, §9).
+ *
+ * PROPERTIES OF AN AUTHORIZATION (W1 §8, W2 §3)
+ * ─────────────────────────────────────────────
+ *   employee-specific  bound to one named user
+ *   device-bound       bound to a device public-key credential; the private key
+ *                      never leaves the device, so a copied grant cannot be
+ *                      redeemed elsewhere
+ *   one-time           consumed at first successful use, never replayable (§24)
+ *   short-lived        5 minutes, enforced independently by every validator
+ *   context-bound      tied to the W1 session and target application
+ *
+ * The 7-day Website 1 session is never itself a Website 2 credential (W1 §21).
+ *
+ * FAILURE POSTURE (W1 §19)
+ * ────────────────────────
+ * Every path here fails closed. An error, an unknown state, or an unreachable
+ * dependency denies the authorization; nothing is granted "because the check
+ * could not be completed".
+ *
+ * REJECTION DETAIL (W2 §15)
+ * ─────────────────────────
+ * Reason codes returned by this module are INTERNAL. Callers log them and
+ * answer the client generically — the Gateway must not tell an attacker whether
+ * a grant was expired, already consumed, or bound to another device.
  */
 
 import { SignJWT } from "jose";
 import crypto from "crypto";
 import { prisma } from "../db";
-import { AUTHZ_SIGNING_SECRET, AUTHZ_TTL_SECONDS } from "../config";
-import { AuthzStatus } from "@prisma/client";
+import {
+  AUTHZ_SIGNING_SECRET,
+  AUTHZ_TTL_SECONDS,
+  CLOCK_SKEW_TOLERANCE_MS,
+} from "../config";
+import { AuthzStatus, DeviceCredentialStatus } from "@prisma/client";
+import { credentialUsability } from "../device";
 
 // ── Internal types ─────────────────────────────────────────────────────────────
 
@@ -24,6 +53,14 @@ export interface AuthorizationRequest {
   userId: string;
   ipAddress: string;
   userAgent: string;
+  /** §8: the device credential this grant is cryptographically bound to. */
+  deviceCredentialId: string;
+  /** Nonce of the device challenge that was proved to obtain this grant. */
+  bindingNonce?: string;
+  targetApp?: string;
+  /** §16: set for administrative emergency authorizations. */
+  emergency?: boolean;
+  issuedByAdminId?: string;
 }
 
 export interface AuthorizationResult {
@@ -40,7 +77,10 @@ export interface AuthorizationVerification {
   userName?: string;
   userRole?: string;
   sessionId?: string;
+  deviceCredentialId?: string;
   expiresAt?: Date;
+  emergency?: boolean;
+  /** INTERNAL only — never returned to an unauthenticated client verbatim. */
   reason?: string;
 }
 
@@ -50,6 +90,14 @@ function getSigningKey(): Uint8Array {
   return new TextEncoder().encode(AUTHZ_SIGNING_SECRET);
 }
 
+/**
+ * Hashed User-Agent.
+ *
+ * TELEMETRY ONLY. W1 §5 is explicit that UA strings are trivially spoofed and
+ * must not be treated as device identity; that role belongs to the device
+ * credential. This value is recorded for correlation and risk input, and is
+ * never on its own a reason to allow or deny.
+ */
 export function hashUA(userAgent: string): string {
   return crypto.createHash("sha256").update(userAgent || "unknown-ua").digest("hex").slice(0, 16);
 }
@@ -58,11 +106,25 @@ function hashToken(token: string): string {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
 
+/**
+ * Expiry check with the single agreed skew tolerance.
+ *
+ * Three components enforce the same 5-minute window against three clocks
+ * (W1 §23 open item). Server time is authoritative everywhere and client
+ * timestamps are never consulted (W2 §3); this is the only slack permitted.
+ */
+function isExpired(expiresAt: Date, now: Date = new Date()): boolean {
+  return expiresAt.getTime() + CLOCK_SKEW_TOLERANCE_MS < now.getTime();
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /**
- * 1. Issue a single-use exchange code for an active session (60s TTL).
- * Passed in redirect URL to Website 2 (e.g. ?code=...).
+ * 1. Issue a single-use exchange code for an already-issued authorization.
+ *
+ * The code is a front-channel handle only — it carries no authority of its own,
+ * and it can only be exchanged for the authorization it names. It is bound to
+ * the same session and device as that authorization.
  */
 export async function issueExchangeCode(params: {
   sessionId: string;
@@ -99,13 +161,26 @@ export async function issueExchangeCode(params: {
 }
 
 /**
- * 2. Back-channel exchange: Website 2 exchanges the code for an Authorization Token.
+ * 2. Back-channel exchange: Website 2 redeems the code for the authorization
+ *    that was already minted at Connect time.
+ *
+ * The code is claimed with a conditional update on `used: false`, so two
+ * concurrent redemptions cannot both succeed. This does NOT consume the
+ * authorization — that happens only once Website 2 has independently verified
+ * the device (§8.1) and actually established a session, so a failed handshake
+ * does not burn the employee's grant.
  */
 export async function exchangeCodeForToken(params: {
   code: string;
   ipAddress: string;
   userAgent: string;
-}): Promise<AuthorizationResult & { user: { id: string; name: string; email: string; role: string } }> {
+}): Promise<
+  AuthorizationResult & {
+    deviceCredentialId: string | null;
+    emergency: boolean;
+    user: { id: string; name: string; email: string; role: string };
+  }
+> {
   const record = await prisma.authExchangeCode.findUnique({
     where: { code: params.code },
   });
@@ -114,13 +189,12 @@ export async function exchangeCodeForToken(params: {
     throw new Error("INVALID_OR_EXPIRED_CODE");
   }
 
-  // Mark code as used immediately (single-use enforcement)
-  await prisma.authExchangeCode.update({
-    where: { id: record.id },
+  const claimed = await prisma.authExchangeCode.updateMany({
+    where: { id: record.id, used: false },
     data: { used: true },
   });
+  if (claimed.count !== 1) throw new Error("INVALID_OR_EXPIRED_CODE");
 
-  // Verify session is still active
   const session = await prisma.session.findUnique({
     where: { id: record.sessionId },
     include: { user: true },
@@ -130,45 +204,32 @@ export async function exchangeCodeForToken(params: {
     throw new Error("SESSION_EXPIRED");
   }
 
-  // Issue Authorization Token
-  const expiresAt = new Date(Date.now() + AUTHZ_TTL_SECONDS * 1000);
-  const uaHash = hashUA(params.userAgent);
+  // W2 §22: an administratively revoked employee gets nothing, even holding a
+  // valid code.
+  if (session.user.accessRevoked) throw new Error("ACCESS_REVOKED");
 
-  const tokenJwt = await new SignJWT({
-    sub: session.userId,
-    email: session.user.email,
-    name: session.user.name,
-    role: session.user.role,
-    sid: session.id,
-    uah: uaHash,
-    ip: params.ipAddress,
-  })
-    .setProtectedHeader({ alg: "HS256" })
-    .setIssuedAt()
-    .setExpirationTime(expiresAt)
-    .setIssuer("zerogate-authz-service")
-    .setAudience("operations-desk")
-    .sign(getSigningKey());
-
-  const tokenHash = hashToken(tokenJwt);
-
-  const authzRecord = await prisma.authorizationToken.create({
-    data: {
-      userId: session.userId,
-      sessionId: session.id,
-      tokenHash,
-      ipAddress: params.ipAddress,
-      userAgent: uaHash,
+  // The authorization already exists — Connect minted it after the risk
+  // assessment and the device proof. The code does not mint a second one.
+  const authz = await prisma.authorizationToken.findFirst({
+    where: {
+      sessionId: record.sessionId,
+      userId: record.userId,
       status: AuthzStatus.ACTIVE,
-      expiresAt,
+      consumedAt: null,
+      targetApp: record.targetApp,
+      expiresAt: { gt: new Date() },
     },
+    orderBy: { issuedAt: "desc" },
   });
 
+  if (!authz) throw new Error("NO_ACTIVE_AUTHORIZATION");
+
   return {
-    tokenId: authzRecord.id,
-    tokenJwt,
-    expiresAt,
-    ttlSeconds: AUTHZ_TTL_SECONDS,
+    tokenId: authz.id,
+    expiresAt: authz.expiresAt,
+    ttlSeconds: Math.max(0, Math.floor((authz.expiresAt.getTime() - Date.now()) / 1000)),
+    deviceCredentialId: authz.deviceCredentialId,
+    emergency: authz.emergency,
     user: {
       id: session.user.id,
       name: session.user.name,
@@ -179,46 +240,68 @@ export async function exchangeCodeForToken(params: {
 }
 
 /**
- * 3. Live per-request token verification / introspection.
- * Called by Website 2 on EVERY request to enforce immediate revocation.
+ * 3. Introspection.
+ *
+ * Called by the Gateway before allowing a session to be established. It
+ * verifies state and binding but does not consume — consumption is a separate,
+ * explicit step so that a check can never accidentally spend a grant.
  */
 export async function introspectTokenLive(params: {
   tokenId: string;
-  userAgent: string;
+  /** Telemetry only. Never a pass/fail input on its own. */
+  userAgent?: string;
   ipAddress?: string;
+  /** §8: the device that is actually presenting the grant. */
+  deviceCredentialId?: string;
 }): Promise<AuthorizationVerification> {
   const record = await prisma.authorizationToken.findUnique({
     where: { id: params.tokenId },
-    include: {
-      session: true,
-      user: true,
-    },
+    include: { session: true, user: true },
   });
 
-  if (!record) {
-    return { valid: false, reason: "TOKEN_NOT_FOUND" };
+  if (!record) return { valid: false, reason: "TOKEN_NOT_FOUND" };
+  if (record.status === AuthzStatus.REVOKED) return { valid: false, reason: "TOKEN_REVOKED" };
+
+  // §24: one-time. A consumed grant is dead, and asking again is a replay.
+  if (record.status === AuthzStatus.CONSUMED || record.consumedAt) {
+    return { valid: false, reason: "TOKEN_ALREADY_CONSUMED" };
   }
 
-  if (record.status === AuthzStatus.REVOKED) {
-    return { valid: false, reason: "TOKEN_REVOKED" };
-  }
-
-  if (record.expiresAt < new Date()) {
+  if (isExpired(record.expiresAt)) {
     await prisma.authorizationToken
-      .update({ where: { id: record.id }, data: { status: AuthzStatus.EXPIRED } })
+      .updateMany({
+        where: { id: record.id, status: AuthzStatus.ACTIVE },
+        data: { status: AuthzStatus.EXPIRED },
+      })
       .catch(() => {});
     return { valid: false, reason: "TOKEN_EXPIRED" };
   }
 
-  // Verify device binding (hashed UA)
-  const expectedUAHash = hashUA(params.userAgent);
-  if (record.userAgent !== expectedUAHash) {
+  // §8: cryptographic device binding. The caller must already have verified a
+  // device proof and pass the resulting credential id here.
+  if (params.deviceCredentialId && record.deviceCredentialId !== params.deviceCredentialId) {
     return { valid: false, reason: "DEVICE_MISMATCH" };
   }
 
-  // Verify session is still active
-  if (record.session.status !== "ACTIVE" || record.session.expiresAt < new Date()) {
-    return { valid: false, reason: "SESSION_EXPIRED" };
+  if (record.deviceCredentialId) {
+    const credential = await prisma.deviceCredential.findUnique({
+      where: { id: record.deviceCredentialId },
+    });
+    if (!credential || credential.status !== DeviceCredentialStatus.ACTIVE) {
+      return { valid: false, reason: "DEVICE_CREDENTIAL_REVOKED" };
+    }
+    const usability = credentialUsability(credential);
+    if (!usability.usable) return { valid: false, reason: usability.reason };
+  }
+
+  if (record.user.accessRevoked) return { valid: false, reason: "ACCESS_REVOKED" };
+
+  // An emergency authorization is issued while Website 1 is down, so it
+  // deliberately does not require a live, healthy W1 session behind it.
+  if (!record.emergency) {
+    if (record.session.status !== "ACTIVE" || record.session.expiresAt < new Date()) {
+      return { valid: false, reason: "SESSION_EXPIRED" };
+    }
   }
 
   return {
@@ -228,21 +311,52 @@ export async function introspectTokenLive(params: {
     userName: record.user.name,
     userRole: record.user.role,
     sessionId: record.sessionId,
+    deviceCredentialId: record.deviceCredentialId ?? undefined,
     expiresAt: record.expiresAt,
+    emergency: record.emergency,
   };
 }
 
 /**
- * Verify an authorization token by its DB record ID and session binding (for legacy gateway verification).
+ * Consume an authorization (W1 §8, W2 §3 step 9, §24).
+ *
+ * The conditional update on `consumedAt: null` is the actual one-time
+ * enforcement: two devices redeeming the same grant simultaneously produce one
+ * winner and one `TOKEN_ALREADY_CONSUMED`. A read-then-write would let both in.
+ */
+export async function consumeAuthorization(params: {
+  tokenId: string;
+  deviceCredentialId: string;
+}): Promise<{ ok: boolean; reason?: string }> {
+  const verification = await introspectTokenLive({
+    tokenId: params.tokenId,
+    deviceCredentialId: params.deviceCredentialId,
+  });
+  if (!verification.valid) return { ok: false, reason: verification.reason };
+
+  const claimed = await prisma.authorizationToken.updateMany({
+    where: { id: params.tokenId, consumedAt: null, status: AuthzStatus.ACTIVE },
+    data: { status: AuthzStatus.CONSUMED, consumedAt: new Date() },
+  });
+
+  if (claimed.count !== 1) return { ok: false, reason: "TOKEN_ALREADY_CONSUMED" };
+  return { ok: true };
+}
+
+/**
+ * Verify an authorization against its originating Website 1 session.
+ * Used where the caller can prove the session context as well.
  */
 export async function verifyAuthorization(params: {
   tokenId: string;
   sessionId: string;
-  userAgent: string;
+  userAgent?: string;
+  deviceCredentialId?: string;
 }): Promise<AuthorizationVerification> {
   const result = await introspectTokenLive({
     tokenId: params.tokenId,
     userAgent: params.userAgent,
+    deviceCredentialId: params.deviceCredentialId,
   });
 
   if (!result.valid) return result;
@@ -255,44 +369,84 @@ export async function verifyAuthorization(params: {
 }
 
 /**
- * Issue a new short-lived authorization token directly.
+ * Issue a fresh 5-minute Gateway authorization.
+ *
+ * Callers must have already run the Connect-time risk assessment and verified
+ * a device proof; this function enforces the invariants that must hold
+ * regardless of who is calling.
  */
 export async function issueAuthorization(
   req: AuthorizationRequest
 ): Promise<AuthorizationResult> {
   const session = await prisma.session.findUnique({
     where: { id: req.sessionId },
+    include: { user: true },
   });
 
-  if (!session || session.status !== "ACTIVE" || session.expiresAt < new Date()) {
-    throw new Error("SESSION_INVALID");
+  if (!session) throw new Error("SESSION_INVALID");
+
+  // Emergency authorizations are issued precisely when Website 1 is
+  // unavailable, so they are exempt from the *live-session* requirement — but
+  // from nothing else: employee-specific, device-bound, one-time, 5 minutes.
+  if (!req.emergency) {
+    if (session.status !== "ACTIVE" || session.expiresAt < new Date()) {
+      throw new Error("SESSION_INVALID");
+    }
   }
+
+  if (session.user.accessRevoked) throw new Error("ACCESS_REVOKED");
+
+  // §8: no device binding, no authorization. Refusing here is what keeps a
+  // caller from quietly minting an unbound, freely-copyable grant.
+  const credential = await prisma.deviceCredential.findUnique({
+    where: { id: req.deviceCredentialId },
+  });
+  if (!credential || credential.userId !== req.userId) {
+    throw new Error("DEVICE_CREDENTIAL_INVALID");
+  }
+  const usability = credentialUsability(credential);
+  if (!usability.usable) throw new Error(usability.reason ?? "DEVICE_CREDENTIAL_INVALID");
 
   const expiresAt = new Date(Date.now() + AUTHZ_TTL_SECONDS * 1000);
   const uaHash = hashUA(req.userAgent);
 
+  // The JWT is for the Gateway's own validation. It is never handed to the
+  // browser: the client only ever sees the opaque token id.
+  //
+  // `jti` is not decoration. Every other claim is identical for two grants
+  // minted for the same employee, session and device, and `iat` only has
+  // one-second resolution — so without a per-grant nonce, two Connects inside
+  // the same second would produce byte-identical tokens. That would collide on
+  // the unique tokenHash, and worse, would make two distinct authorizations
+  // indistinguishable from one another.
   const token = await new SignJWT({
     sub: req.userId,
     sid: req.sessionId,
+    dcid: req.deviceCredentialId,
     uah: uaHash,
     ip: req.ipAddress,
+    emg: req.emergency ?? false,
   })
     .setProtectedHeader({ alg: "HS256" })
+    .setJti(crypto.randomUUID())
     .setIssuedAt()
     .setExpirationTime(expiresAt)
     .setIssuer("zerogate-authz-service")
     .setAudience("zerogate-gateway")
     .sign(getSigningKey());
 
-  const tokenHash = hashToken(token);
-
   const record = await prisma.authorizationToken.create({
     data: {
       userId: req.userId,
       sessionId: req.sessionId,
-      tokenHash,
+      tokenHash: hashToken(token),
       ipAddress: req.ipAddress,
       userAgent: uaHash,
+      deviceCredentialId: req.deviceCredentialId,
+      bindingNonce: req.bindingNonce ?? null,
+      targetApp: req.targetApp ?? "operations-desk",
+      emergency: req.emergency ?? false,
+      issuedByAdminId: req.issuedByAdminId ?? null,
       status: AuthzStatus.ACTIVE,
       expiresAt,
     },
@@ -305,19 +459,24 @@ export async function issueAuthorization(
   };
 }
 
-/**
- * Revoke an authorization token immediately.
- */
+/** Revoke an authorization immediately. */
 export async function revokeAuthorization(tokenId: string): Promise<void> {
-  await prisma.authorizationToken.update({
-    where: { id: tokenId },
+  await prisma.authorizationToken.updateMany({
+    where: { id: tokenId, status: { notIn: [AuthzStatus.REVOKED] } },
     data: { status: AuthzStatus.REVOKED, revokedAt: new Date() },
   });
 }
 
-/**
- * Get active authorization for a session.
- */
+/** Revoke every outstanding authorization for an employee (§21, §22). */
+export async function revokeAllAuthorizationsForUser(userId: string): Promise<number> {
+  const result = await prisma.authorizationToken.updateMany({
+    where: { userId, status: AuthzStatus.ACTIVE },
+    data: { status: AuthzStatus.REVOKED, revokedAt: new Date() },
+  });
+  return result.count;
+}
+
+/** The session's outstanding, unconsumed authorization, if any. */
 export async function getActiveAuthorization(
   sessionId: string
 ): Promise<{ tokenId: string; expiresAt: Date; ttlSeconds: number } | null> {
@@ -326,6 +485,7 @@ export async function getActiveAuthorization(
     where: {
       sessionId,
       status: AuthzStatus.ACTIVE,
+      consumedAt: null,
       expiresAt: { gt: now },
     },
     orderBy: { issuedAt: "desc" },
@@ -333,10 +493,9 @@ export async function getActiveAuthorization(
 
   if (!record) return null;
 
-  const remainingMs = record.expiresAt.getTime() - now.getTime();
   return {
     tokenId: record.id,
     expiresAt: record.expiresAt,
-    ttlSeconds: Math.floor(remainingMs / 1000),
+    ttlSeconds: Math.floor((record.expiresAt.getTime() - now.getTime()) / 1000),
   };
 }
