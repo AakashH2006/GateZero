@@ -48,7 +48,7 @@ of resting entirely on Website 2's skepticism.
 
 ## 2. Service-to-service authentication
 
-Today: a shared HMAC secret (§7 of PROJECT.md flags this as a mock).
+Today: a shared HMAC secret (§7 of README.md flags this as a mock).
 Production:
 
 - **mTLS with per-peer certificates.** Website 1 and Website 2 each hold a
@@ -90,7 +90,7 @@ the shared secret. Redesign:
 ## 4. Key management
 
 - The grant-signing key lives in an HSM or KMS. It is never an environment
-  variable, never on disk in plaintext — this closes the gap PROJECT.md §7
+  variable, never on disk in plaintext — this closes the gap README.md §7
   names explicitly ("Signing keys: env vars → HSM / secrets manager").
 - Keys rotate automatically. Because grants live at most 5 minutes, a
   rotation only needs to keep the immediately-previous key valid for
@@ -112,7 +112,7 @@ the shared secret. Redesign:
 | Gateway process is down | Connect fails — never "connect anyway" |
 
 No ambiguous state resolves to permissive. This mirrors the same rule already
-applied to device-proof failures (PROJECT.md §3): an unclassified failure
+applied to device-proof failures (README.md §3): an unclassified failure
 fails safe as hostile, so a new failure mode introduced later can't silently
 become a bypass just because nobody wrote a case for it yet.
 
@@ -134,7 +134,7 @@ become a bypass just because nobody wrote a case for it yet.
   redemption, verification, address resolution for Website 2, and the
   event-relay endpoint — and nothing else. No admin surface, no debug
   endpoint, no general-purpose API. "Never becomes a general API" (an
-  explicit non-goal in PROJECT.md §1) is enforced by there being no code
+  explicit non-goal in README.md §1) is enforced by there being no code
   for anything else, the same way Website 2's out-of-band revoke endpoint is
   kept to one operation by having no code for a second one.
 
@@ -177,7 +177,7 @@ administrator termination, device revocation) — it does not originate them.
   fully compromised Gateway can't fabricate a new event, only withhold or
   delay a real one — and withholding is caught by Website 2's own
   reconciliation, which re-derives critical state from the system of record
-  when delivery can't be confirmed (PROJECT.md §3).
+  when delivery can't be confirmed (README.md §3).
 - The pull model is unchanged: Website 2 asks, the Gateway never pushes into
   Website 2. No event-injection surface exists on the Gateway side either.
 
@@ -191,7 +191,7 @@ administrator termination, device revocation) — it does not originate them.
   using the same tamper-**evident** mechanism already in place. In
   production this writes to an append-only external sink rather than the
   application database, closing the "detection, not prevention" gap noted
-  for the system as a whole (PROJECT.md §3, §7).
+  for the system as a whole (README.md §3, §7).
 - Metrics and denials feed the same alerting path as the rest of the system,
   replacing the `console.warn` stub with real SIEM/pager integration for at
   least the Gateway's own events.
@@ -215,8 +215,8 @@ is — not about relying on the Gateway being trustworthy.
 |---|---|
 | mTLS / workload-identity rollout (SPIFFE/SPIRE or equivalent) | Design only — not built |
 | HSM/KMS integration for the grant-signing key | Design only — not built |
-| Append-only external audit sink | Shared gap with rest of system (PROJECT.md §7); Gateway should not ship its own separate solution |
-| SIEM/pager integration | Shared gap with rest of system (PROJECT.md §7) |
+| Append-only external audit sink | Shared gap with rest of system (README.md §7); Gateway should not ship its own separate solution |
+| SIEM/pager integration | Shared gap with rest of system (README.md §7) |
 | Coordination with Website 2's in-memory handshake store | Both must move to shared state together before either scales past one instance |
 
 None of these change the core guarantee. They determine how expensive it is

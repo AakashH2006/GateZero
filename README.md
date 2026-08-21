@@ -1,292 +1,516 @@
 # GateZero
 
-A zero-trust access architecture that removes an internal application from the public internet entirely, forwarding traffic to it only through a single hardened gateway — and only when a currently valid, explicitly-requested authorization exists.
+A zero-trust access gateway. An employee authenticates once on a public portal
+(**Website 1**), and every time they need the protected work environment
+(**Website 2**) they click **Connect** and pass a fresh checkpoint.
+
+---
 
 ## The problem
 
-Most internal apps are protected by a login page (often with MFA). But the app itself still sits on the public internet the whole time — its address, open port, software version, and login page are all scannable and attackable 24/7, regardless of whether anyone ever logs in. **Protecting the login is not the same as protecting the application.**
+Most internal apps are protected by a login page, often with MFA. But the app
+itself still sits on the public internet the whole time — its address, open
+port, software version, and login page are all scannable and attackable around
+the clock, whether or not anyone ever logs in. **Protecting the login is not the
+same as protecting the application.**
 
-Traditional VPNs improve on this, but a single login often grants broad network access, and the VPN gateway itself becomes a high-value, frequently-exploited target.
+Traditional VPNs improve on this, but a single login often grants broad network
+access, and the VPN gateway itself becomes a high-value, frequently-exploited
+target.
 
 ## The approach
 
-GateZero splits access into two websites connected only by a chain of trust:
+GateZero splits access across three components connected only by a chain of
+trust:
 
-- **Website 1 (Portal)** — a normal, publicly reachable login page. Handles SSO + MFA and starts a 7-day session. It never exposes Website 2's URL, IP, credentials, or infrastructure.
-- **Website 2 (Internal Application)** — the actual sensitive app. It is *never* directly exposed to the internet. The only way to reach it is through the Access Gateway.
+- **Website 1 — the portal.** A normal, publicly reachable login page. Handles
+  SSO + MFA and starts a 7-day session. It never learns Website 2's URL, IP, or
+  credentials, and it holds no code that can mint an authorization.
+- **The Gateway.** Its own process. The only component that decides
+  authorization, signs the short-lived grant, and knows where Website 2 lives.
+- **Website 2 — the internal application.** The actual sensitive app, never
+  directly exposed. Reachable only through the Gateway, and it verifies every
+  device itself rather than trusting the Gateway's word.
 
-Logging into Website 1 does **not** grant access to Website 2. It only reveals a **Connect** button. The employee must explicitly click Connect, whenever they actually need Website 2, before any authorization is issued.
+Signing into Website 1 does **not** grant access to Website 2. It only reveals a
+**Connect** button. The employee must explicitly click Connect, each time they
+actually need Website 2, before any authorization exists.
 
-Clicking Connect doesn't redirect anywhere — it causes Website 1 to ask the **Authorization Service** to verify the 7-day session and issue a short-lived authorization to the **Access Gateway**. The employee then separately opens Website 2's own address; that connection is physically forwarded through the Gateway, and only forwarded at all if the authorization is currently valid.
+Connect does not redirect anywhere. It causes Website 1 to prove the employee's
+device cryptographically, run a risk assessment, and ask the Gateway for a
+five-minute, one-time, device-bound grant. Only then can a Website 2 session be
+established — and Website 2 independently re-checks the device before trusting
+it.
 
-There is no shared session, no redirect, and no code path directly connecting Website 1 and Website 2. The only link between them is a short-lived authorization signal, requested on demand, and mediated entirely by the Authorization Service.
+There is no shared session and no code path directly connecting Website 1 and
+Website 2. The only link is a short-lived signed grant, requested on demand and
+mediated entirely by the Gateway.
 
-An attacker cannot attack, scan, or exploit something they cannot reach — so GateZero shrinks the internet-facing attack surface down to two purpose-built, heavily hardened components (Website 1 and the Gateway), instead of the full sensitive application.
+An attacker cannot attack what they cannot reach, so the internet-facing attack
+surface shrinks to two purpose-built, hardened components instead of the full
+sensitive application.
 
-## Architecture
+The whole system exists to hold one line:
 
-```
-PUBLIC INTERNET
-      │
-      │ (1) employee logs in (SSO + MFA)
-      ▼
-┌──────────────────┐
-│    WEBSITE 1      │ ← always reachable publicly
-│ (Portal: SSO+MFA) │
-└──────────────────┘
-      │
-      │ (2) 7-day session starts, Connect button appears
-      │ (3) employee clicks Connect — on demand, not automatic
-      ▼
-┌───────────────────────┐
-│ AUTHORIZATION SERVICE  │ ← internal only, trust root
-└───────────────────────┘
-      │
-      │ (4) mTLS: verify 7-day session, issue short-lived authorization
-      ▼
-┌──────────────────┐
-│  ACCESS GATEWAY   │ ← ONLY entry point to Website 2
-│ (mTLS to Website 2)│
-└──────────────────┘
-      ▲                    │
-      │ (5) employee        │ (6) forwarded only if
-      │ connects here       │ currently authorized
-      │ separately          ▼
-  [ browser ]        ┌──────────────────┐
-                      │    WEBSITE 2      │ ← never internet-facing directly
-                      │ (Internal App)     │
-                      └──────────────────┘
-```
+> **Authentication at Website 1 establishes identity; it does not establish
+> access to Website 2.**
 
-**Core principle:** Website 1 proves identity → the Authorization Service manages authorization → the Access Gateway enforces access → Website 2 serves the application. No direct Website 1 ↔ Website 2 relationship exists.
+A stolen Website 1 session does not get you into Website 2. A stolen Website 2
+session cookie does not get you in from another machine. A compromised Gateway
+does not get you a trusted Website 2 session. Each is enforced by a different
+mechanism, and each is tested.
 
-There are two paths through the system, and they never merge:
+This document describes the system as built. The authoritative designs are
+[`website-1-defense.md`](website-1-defense.md),
+[`website-2-defense.md`](website-2-defense.md) and
+[`gateway-defense.md`](gateway-defense.md); section references below (§) point
+into them.
 
-- **Control path:** Website 1 → Authorization Service → Gateway, triggered only by an explicit Connect click, carrying an authorization decision.
-- **Data path:** browser → Gateway → Website 2, carrying the employee's actual traffic. Website 1 has no part in this path at all.
+---
 
-### Components
+## 1. The three components
 
-| Component | Role | Reachable From |
+| | Responsibility | Never does |
 |---|---|---|
-| **Website 1 (Portal)** | Handles SSO + MFA login and starts the 7-day session. Shows a Connect button once logged in — access to Website 2 is never automatic. | Public internet, always |
-| **Authorization Service** | Trust root of the system. On Connect, verifies the 7-day session over mTLS with Website 1, then issues a short-lived authorization to the Gateway. Issues nothing without an explicit Connect request. | Internal only |
-| **Access Gateway** | The only entry point to Website 2. Verifies authorization before forwarding, connects to Website 2 via mTLS, and can terminate active connections immediately on revocation. | Internal only |
-| **Website 2 (Internal Application)** | The sensitive app itself. Accepts traffic only from the Gateway, requires its own login + MFA every 24 hours, and has strict egress restrictions. | Never directly — only via the Gateway |
+| **Website 1** — the portal | SSO + MFA, the 7-day session, the Connect action, Mini EDR risk scoring, requesting authorization | Grant access. Learn Website 2's address. Declare itself unavailable. |
+| **Gateway** (`server-gateway.ts`, :3001) | Decide authorization, mint the ES256-signed one-time grant, resolve where Website 2 lives, relay critical events | Store passwords or business data. Become a general API. Monitor Website 2. Expose any admin or debug surface. |
+| **Website 2** — the Operations Desk | Establish and guard the work session, verify the device itself, enforce its own limits | Trust the Gateway's word about a device. Depend on Website 1 staying up. |
 
-## Session model: two clocks, plus an explicit gate
-
-GateZero runs two independent session clocks, and neither grants access by itself:
-
-- **Clock 1 — Website 1 session (7 days):** "Is this still the right person, recently verified through full SSO + MFA?"
-- **Clock 2 — Website 2 login (24 hours):** "Has this person proven themselves again today, right before touching the sensitive application?" — with its own MFA check.
-
-A stolen or leaked Website 1 session is not, by itself, a week of access to Website 2 — it isn't even a minute of access until Connect is explicitly clicked. Every Connect click is logged independently of login logs, giving a clear audit trail of intent.
-
-## Step-by-step flow
-
-1. **Employee visits Website 1.** Website 2 will not respond at all yet, even if its address is already known.
-2. **Company SSO login** via the existing identity provider (Okta, Azure AD, Google Workspace, etc.).
-3. **MFA.** Login does not proceed without a second factor.
-4. **7-day session starts, Connect button appears.** Nothing further happens automatically.
-5. **Employee clicks Connect** whenever Website 2 is actually needed — this can happen immediately, later, or any day within the 7-day window.
-6. **Authorization Service verifies the session** and issues a short-lived authorization to the Gateway.
-7. **Employee opens Website 2 directly.** The connection arrives at the Gateway, which forwards it only because a valid authorization exists.
-8. **Daily login at Website 2**, with its own independent MFA, every 24 hours.
-9. **Access ends** automatically (short-lived grant expiry, 24-hour Website 2 session, or 7-day Website 1 session) or immediately on administrator revocation.
-
-## Security controls on the trust chain
-
-- Authorization is never automatic — a valid 7-day session only reveals the Connect button.
-- Every internal hop is mutually authenticated (mTLS): Website 1 ↔ Authorization Service, Authorization Service ↔ Gateway, Gateway ↔ Website 2.
-- Gateway private keys and Authorization Service signing keys are stored in a vault/HSM, with defined rotation and revocation procedures.
-- Website 2 has strict egress restrictions — a compromised Website 2 cannot reach back to Website 1, the Authorization Service, or the Gateway's management interface.
-- Revocation is push-based; if the Gateway is unreachable, the authorization's own expiry acts as the worst-case bound.
-- Every Connect click is logged with outcome (issued/denied), separate from login logs.
-
-## Additional hardening
-
-- **High availability** — redundant Authorization Service and Gateway instances with health checks, failover, and DDoS/rate-limit protection.
-- **Short-lived grants** — each Connect action issues a grant initially proposed at 5 minutes, tunable based on testing.
-- **Connect rate limiting** — per user, device/session, and IP.
-- **MFA-fatigue protection** — phishing-resistant MFA preferred; number-matching and rate limiting where push MFA is used.
-- **Device/session binding** — each grant is bound to the authenticated device/session, closing the token-replay gap of bearer-style grants.
-- **Emergency kill switch (planned)** — system-wide invalidation of all sessions/grants if the signing key is ever suspected compromised.
-- **Gateway protection** — management interfaces isolated from Website 2 and the public internet.
-
-## Why it matters
-
-Because Website 1 and Website 2 are never directly linked, an attacker who finds Website 1 still cannot see, scan, or reach Website 2. Even an attacker who fully compromises Website 2 cannot pivot outward — egress restrictions block any path back to the Gateway, Authorization Service, or Website 1. Security effort concentrates on two purpose-built components instead of being spread across the entire sensitive application — while, from the employee's side, it's simply logging in, clicking Connect when needed, and opening Website 2 as usual.
+Website 1 is the only permanently public-facing part. Website 2 sits behind the
+Gateway and, in production, on a private network with no public DNS.
 
 ---
 
-## 💻 Implementation
-
-This repository contains the working implementation of the GateZero architecture described above.
-
-### 🏗️ Implementation Architecture
+## 2. The trust chain
 
 ```
-Browser
-  │
-  ▼
-┌─────────────────────────────────────────────┐
-│         Website 1 — GateZero Gateway        │
-│         Next.js 16 + TypeScript + Prisma    │
-│                                             │
-│  /api/auth/*    — SSO + Email MFA           │
-│  /api/authz/*   — Zero-Trust token service  │
-│  /api/connect   — Authorization grant       │
-│  /api/admin/*   — Admin management          │
-│  /api/mock-idp  — Mock IdP (dev only)       │
-│                                             │
-│  Port: 3000                                 │
-└─────────────────────┬───────────────────────┘
-                      │  Exchange Code Handshake
-                      │  (60s TTL, single-use)
-                      ▼
-┌─────────────────────────────────────────────┐
-│     Website 2 — The Operations Desk         │
-│     Standalone Express Server               │
-│                                             │
-│  Per-request live token introspection       │
-│  Zero-Trust: validates every request        │
-│  Neutral 401 Gateway Intercept Screen       │
-│                                             │
-│  Port: 3002 (bound to 127.0.0.1)           │
-└─────────────────────────────────────────────┘
+SSO + MFA
+    │
+    ▼
+7-day Website 1 session          ← proves identity, grants nothing
+    │
+    │  employee clicks Connect
+    ▼
+Device proof  (ECDSA signature over a single-use nonce)
+    │
+    ▼
+Mini EDR risk assessment          ← LOW / MEDIUM / HIGH / CRITICAL
+    │
+    ▼
+Authorization Service
+    │
+    ▼
+5-minute authorization             ← one-time, device-bound, employee-specific
+    │
+    ▼
+Gateway
+    │
+    ▼
+Website 2 verifies the device ITSELF   ← independent second checkpoint (§8.1)
+    │
+    ▼
+Website 2 session                  ← own limits, own revocation, own re-proofs
 ```
 
-### ✨ Key Features
+Every arrow is a place something can be refused. The grant is consumed at the
+last step and can never be replayed.
 
-**Website 1 — GateZero Access Gateway**
-- Employee SSO Login via Mock IdP (PKCE-based OAuth 2.0 flow)
-- Real Email MFA delivery via [Resend](https://resend.com) — 6-digit OTP
-- Anti-Copy-Paste OTP protection on the MFA screen
-- Session Management — 7-day sliding sessions bound to device fingerprint
-- Admin Console — Audit logs, session revocation, token management
-- Sliding-Window Rate Limiting — Protects against brute-force and DoS
+---
 
-**Website 2 — The Operations Desk**
-- Zero-Trust Gating — Every request live-introspects the token against Website 1
-- OIDC-Style Handshake — Single-use exchange code (60s TTL), back-channel server-to-server token exchange
-- Instant Revocation — Token revoked on Website 1 = access cut in real-time on Website 2
-- Device Fingerprint Binding — SHA-256 hashed User-Agent binding prevents stolen token reuse
-- Neutral Intercept Screen — Displays a clean "Gateway Access Required" screen on unauthorized access
+## 3. Security properties, and what enforces each
 
-**Security Controls Applied**
-- `X-Frame-Options: DENY` — Clickjacking prevention
-- `X-Content-Type-Options: nosniff` — MIME sniffing prevention
-- `Referrer-Policy: strict-origin-when-cross-origin`
-- HTML entity escaping on all dynamic template renders (Stored XSS defense)
-- `encodeURIComponent` on all URL-interpolated record IDs
+### Cryptographic device identity — W1 §8, W2 §4
 
-### 🚀 Quick Start
+An ECDSA P-256 key pair is generated **in the browser** with
+`extractable: false` and kept in IndexedDB. The private key is never exported,
+never transmitted, and cannot be read by script — including by an XSS payload,
+which can *use* the key but cannot steal it.
 
-**Prerequisites:** Node.js 20+, npm 9+
+Proof of possession is a signature over a fresh, single-use, server-generated
+nonce. The signed message is:
+
+```
+gatezero:v1:<issuer>:<purpose>:<nonce>
+```
+
+The issuer and purpose are **inside the signed bytes** deliberately. A signature
+produced for Website 1's Connect challenge cannot be replayed as the answer to
+Website 2's independent challenge, even while both nonces are live.
+
+Challenges are consumed on first verification — **including on failed
+verification**, which denies an attacker unlimited signature attempts against one
+live nonce.
+
+> **Weaker than the spec, on purpose.** W2 §4 asks for hardware-backed storage
+> (TPM, Secure Enclave). A WebCrypto key is software-protected: strong against
+> script exfiltration, not against an attacker who can read the browser profile
+> at OS level. The spec anticipates exactly this and admits such devices at
+> **lower assurance** rather than rejecting them. The client's `hardwareBacked`
+> claim is a hint recorded by the server, never trusted — a compromised client
+> would simply claim `true`. Production upgrades this to WebAuthn with a platform
+> authenticator, whose attestation is verifiable server-side.
+
+### One-time, device-bound authorization — W1 §8, W2 §24
+
+Each Connect mints a grant that is employee-specific, bound to a device
+credential, valid 5 minutes, and **consumed atomically** the moment a Website 2
+session is established. Second use is rejected as a replay and logged as a
+security event.
+
+Consumption is a conditional `UPDATE ... WHERE consumedAt IS NULL`, so two
+devices redeeming the same grant concurrently produce exactly one winner. A
+read-then-write would let both in.
+
+### Website 2 verifies the device itself — W1 §8.1
+
+Website 2 does not accept the Gateway's assertion that a device is legitimate.
+It issues its **own** nonce, checks the signature itself, and cross-checks the
+public key the Gateway reported against the credential of record. A Gateway that
+forged or mis-validated a binding still cannot produce a trusted session.
+
+### Session theft protection — W2 §14
+
+The session cookie alone is never sufficient. Each session records when it last
+proved possession of its device key; once that lapses (default 5 minutes), the
+next request is held until a fresh signature arrives.
+
+A legitimate browser re-signs **transparently** — a `fetch` interceptor in the
+Desk page does it and replays the request, so the employee sees nothing. Someone
+holding only a stolen cookie cannot produce the signature and stops working
+within one window. The session is asked to re-prove itself, not revoked.
+
+On each successful re-proof the session identifier **rotates** (§16) and the old
+one immediately stops resolving. Rotation does not reset the inactivity or
+absolute lifetimes — it is a theft control, not a way past §17/§18.
+
+### Website 2 session independence — W2 §26, §35
+
+Once established, the session is validated from local state. Website 2 does not
+call the Gateway per request, so an existing session **survives a Website 1 or
+Gateway outage** — which §26 requires. Only a small set of critical events
+crosses the boundary afterwards, pulled asynchronously.
+
+> An earlier iteration re-checked authorization with the Gateway on every
+> request. That inverted the model and broke §26; it was removed.
+
+### Telemetry is not identity — W1 §5, §6
+
+IP address and User-Agent feed the risk score and nothing else. §5 is explicit
+that UA strings are trivially spoofed and must not be treated as identity, and
+that ordinary network changes must not log an employee out. The weights are set
+so that **both telemetry signals together stay below the gate** on a device that
+passed its cryptographic proof — an employee travelling and opening a different
+browser is the ordinary case the spec says must not be interrupted.
+
+### Graded device-proof failures — W1 §5, §7
+
+"The proof didn't succeed" covers very different situations, so the reason is
+graded:
+
+| Class | Examples | Response |
+|---|---|---|
+| **Forgery** | bad signature, credential belongs to someone else | CRITICAL — terminate session, alert |
+| **Misdirection** | challenge redirected across user / purpose / issuer | CRITICAL |
+| **Staleness** | consumed or expired nonce — a retry, a stale tab | refuse Connect, session survives |
+| **Lifecycle** | no device, not yet approved, revoked, past grace | refuse Connect, session survives |
+
+An unclassified reason **fails safe as hostile**, so adding a new failure mode
+without classifying it cannot silently downgrade it.
+
+### Trusted outage detection — W1 §16, W2 §27
+
+> *"Website 1 must never be able to declare itself unavailable."*
+
+Enforced **structurally**, not by convention. Health state is written only by
+`scripts/health-monitor.ts`, an out-of-process monitor. No route handler imports
+`recordProbe`; no API endpoint can set health state. A fully compromised
+Website 1 request path can lie in its `/api/health` response — but lying
+*healthy* opens nothing, and it has no path to the health table.
+
+Emergency access needs **four** independent gates, in order:
+
+1. Sustained failure — N consecutive failed probes **and** a minimum duration, so
+   neither a single blip nor a fast burst can trip it
+2. Explicit human confirmation by an administrator, which expires
+3. A fresh, action-specific administrator re-authentication
+4. A named employee with an active device credential
+
+Recovery is automatic: the first successful probe clears the outage and voids any
+human confirmation, so the window closes by itself.
+
+### Administrative controls — W1 §13–§15
+
+> *"Admin login does not equal permanent administrative authorization."*
+
+Every privileged action spends a **step-up grant** bound to one action, one
+target, single-use, short-lived, and carrying a recorded reason. A grant obtained
+for "revoke a session" cannot be spent on "override MFA". Being signed into the
+admin dashboard grants nothing.
+
+An MFA override produces a session that is flagged, short-lived, and pre-gated so
+the employee must complete real MFA before Connect will work — it can never
+silently become an ordinary 7-day session, and it cannot target an administrator.
+
+### Critical security events — W2 §21, §32
+
+The only things that cross the W1/W2 boundary after establishment:
+password change, access revocation, administrator termination, device
+revocation.
+
+- **At-least-once** — an event is marked delivered only on an explicit ack
+- **Idempotent** — Website 2 keeps a ledger keyed by `eventId`; redelivery is a
+  no-op, which is what makes at-least-once safe
+- **Authenticated** — HMAC over `eventId`, type, `userId`, and payload, so an
+  intercepted event cannot be re-aimed at another employee or given a fresh id
+- **Pull, not push** — Website 2 asks. It exposes no event-injection endpoint at
+  all, so nothing on the network can forge a termination
+- **Reconciled** — if delivery can't be confirmed, Website 2 re-derives the
+  employee's critical state from the system of record
+
+### Tamper-evident audit — W1 §11
+
+Every entry carries a monotonic `seq` and a SHA-256 hash over the previous
+entry's hash plus its own canonical content. Editing or deleting any entry breaks
+verification of every later one. Verify with
+`GET /api/admin/audit-logs?verify=1`.
+
+Metadata passes through a redaction filter, so a careless call site cannot write
+a password or token into the log.
+
+> This is **detection, not prevention**. An attacker with database write access
+> can recompute the whole chain. Real prevention needs an append-only sink
+> outside this database.
+
+---
+
+## 3A. The Gateway as its own process
+
+`gateway-defense.md` is implemented as a real, separate service on :3001.
+
+**Grants are asymmetrically signed (§3).** The Gateway signs each grant with an
+ES256 private key; Website 2 verifies with the **public** key and holds nothing
+capable of minting one. "The Gateway really did approve this" is now a
+cryptographically checkable claim rather than a shared-secret formality. The
+payload carries the employee, a hash of the device public key, `iat`, `exp`, a
+single-use `jti`, and an audience — so a grant minted for Website 2 is refused
+anywhere else even though its signature is perfectly valid.
+
+The `jti` **is** the authorization record's id, so the signed assertion and the
+row that tracks one-time consumption name the same thing.
+
+**Per-peer credentials (§2).** Each service signs with its own derived key
+instead of one secret everyone shares. A leaked Website 2 credential lets an
+attacker speak as Website 2 — not as Website 1.
+
+**Website 1 cannot mint a grant (§1).** The minting code is not in that process.
+Website 1 asks over an authenticated backend call and the Gateway decides.
+Website 1 also cannot construct the handoff URL — it asks, because it holds no
+configuration naming Website 2's address (W1 §4, §9).
+
+**Nothing else is exposed (§6).** Grant issuance, handoff-URL resolution,
+exchange, redemption, the public key, the event relay, and liveness. Every other
+path is a flat 404. No admin surface, no debug endpoint, no general API.
+
+### Where this design was not followed, and why
+
+**No circuit breaker toward Website 2**, despite §7 asking for one. The Gateway
+makes *zero* outbound calls to Website 2 — the event relay is pull-only and the
+handoff is a URL handed to the browser. There is nothing to break. The pull model
+already provides what §7 wants, structurally. A breaker here would be dead code
+that reads like a safeguard while guarding nothing, which is worse than an
+acknowledged absence because it invites the assumption that the risk is handled.
+`server-gateway.ts` carries a note to add one the moment an outbound path
+appears.
+
+---
+
+## 4. Session model — three independent clocks
+
+| Clock | Length | Reset by |
+|---|---|---|
+| Website 1 session | 7 days | fresh SSO + MFA |
+| Gateway authorization | 5 minutes, one-time | each Connect |
+| Website 2 session | 2h idle / 24h absolute (`ESTABLISHED`)<br>3h idle / 36h absolute (`STARTUP`) | meaningful activity only |
+| Website 2 device re-proof | 5 minutes | signing a fresh nonce |
+
+The inactivity timer resets on **meaningful application activity only**.
+Background polling deliberately does not, so an abandoned browser tab cannot keep
+a session alive indefinitely.
+
+Logging out of Website 2 affects Website 2 only — Website 1 stays signed in, and
+the employee can Connect again (§20).
+
+---
+
+## 5. Code map
+
+### Libraries
+
+| Module | Purpose |
+|---|---|
+| `lib/device/` | Device identity: challenges, proofs, registration, rotation, revocation. `client.ts` is the browser-side non-extractable key custody |
+| `lib/authz-service/` | Mints, introspects, and consumes authorizations |
+| `lib/gateway/` | Final enforcement point; resolves where Website 2 lives; single generic denial |
+| `lib/desk-session/` | Website 2 Session Guard — establishment, validation, limits, rotation, revocation |
+| `lib/mini-edr/` | Connect risk scoring. Login/MFA/Connect only; never sees Website 2 |
+| `lib/security-events/` | Cross-boundary critical event outbox, ledger, reconciliation |
+| `lib/health/` | Trusted outage state machine (read-only from the app) |
+| `lib/admin-stepup.ts`, `lib/admin-action.ts` | One-action privileged grants and the guard every admin route uses |
+| `lib/service-auth.ts` | HMAC service-to-service authentication |
+| `lib/audit.ts`, `lib/alerts.ts` | Hash-chained audit trail; severity-gated, deduplicated alerts |
+| `lib/notify/` | Employee notifications from a fixed, secret-free template catalogue |
+| `lib/auth/` | Sessions, CSRF, MFA, PKCE, password reset |
+
+### Notable routes
+
+| Route | Purpose |
+|---|---|
+| `POST /api/connect` | The checkpoint — CSRF, cooldown, step-up gate, rate limit, device proof, risk, grant |
+| `POST /api/device/challenge` · `/api/device` · `/rotate` · `/recovery` | Device lifecycle |
+| `POST /api/authz/code` · `/exchange` · `/redeem` · `/verify` | Handoff and one-time redemption |
+| `GET/POST /api/events` | Critical event pull and ack |
+| `POST /api/admin/step-up` | Administrator re-authentication (one action) |
+| `POST /api/admin/emergency` | Outage confirmation, then emergency Connect |
+| `POST /api/admin/oob-revoke` | Out-of-band revocation when the Gateway is down |
+| `GET /api/health` | Liveness probe — reports, never records |
+
+`server-desk.ts` is Website 2: handshake, its own device verification, the
+Session Guard middleware, the event poller, the revoke-only out-of-band endpoint,
+and the Desk UI.
+
+---
+
+## 6. Running it
 
 ```bash
-# 1. Clone and install
-git clone https://github.com/AakashH2006/GateZero.git
-cd GateZero
 npm install
+npx prisma migrate deploy      # or: npm run db:migrate
+npm run db:seed                # provisions the demo employee AND the admin identity
 
-# 2. Set up environment variables
-cp .env.example .env.local
-# Fill in SESSION_SECRET, AUTHZ_SIGNING_SECRET, and RESEND_API_KEY
-
-# 3. Initialize the database
-npx prisma migrate dev
-
-# 4. Seed demo data
-npm run db:seed
-npm run db:seed-desk
-
-# 5. Start Website 1 (GateZero Gateway)
-npm run dev
-
-# 6. Start Website 2 (The Operations Desk) — in a second terminal
-npm run desk
+npm run dev                    # Website 1, the public portal                 :3000
+npm run gateway                # The Access Gateway                           :3001
+npm run desk                   # Website 2, The Operations Desk               :3002
+npm run health-monitor         # independent outage detection — separate by design
 ```
 
-| Service | URL |
-|:---|:---|
-| GateZero Gateway | http://localhost:3000 |
-| The Operations Desk | http://localhost:3002 |
+Four processes, and the separation is the point: Website 1 has no code that
+mints a grant, and the Gateway has no browser-facing surface.
 
-### 🔄 End-to-End Flow
+The health monitor is a **separate process on purpose** (see §16 above). Without
+it, health state is never written — which fails safe: an absent record is treated
+as HEALTHY, so emergency access stays closed.
 
-1. Visit `http://localhost:3000` → Click **[EMPLOYEE SSO SIGN IN]**
-2. Authenticate via the Mock IdP → Complete **Email MFA** (check your inbox)
-3. On the Dashboard, click **`🚀 [LAUNCH THE OPERATIONS DESK :3002] →`**
-4. GateZero issues a 60-second exchange code, Website 2 exchanges it server-to-server for a token, and grants you access
-5. Direct access to `http://localhost:3002` without going through GateZero returns the **Neutral Gateway Intercept Screen**
+For local development, `DEV_AUTO_APPROVE_DEVICES=true` self-approves device
+registrations that would otherwise need an administrator. It requires
+`DEV_MODE=true` and is impossible to enable in production.
 
-### 🧪 Automated Regression Tests
+### Verification
 
 ```bash
-npm test
+npm run type-check
+npm test        # 163 tests, 11 files
+npm run e2e     # 32 checks across all three servers, with a real EC key
 ```
 
-**28 / 28 tests passing**
+`npm run e2e` is the meaningful one — it drives real HTTP through the entire
+flow and asserts the security properties, including that a Website 1 signature is
+refused at Website 2, that a stolen cookie stops working, and that a rotated
+identifier no longer resolves.
 
-| File | Tests | Coverage |
-|:---|:---:|:---|
-| `__tests__/authz-service.test.ts` | 11 | Token issuance, revocation, session checks, rate limiting, device binding |
-| `__tests__/operations-desk-gate.test.ts` | 7 | Exchange code handshake, live introspection, CRUD operations |
-| `__tests__/security-audit.test.ts` | 10 | Replay attacks, token forgery, MFA bypass, XSS defense |
-
-### ⚙️ Environment Variables
-
-| Variable | Required | Description |
-|:---|:---:|:---|
-| `DATABASE_URL` | ✅ | `file:./prisma/dev.db` for local SQLite |
-| `SESSION_SECRET` | ✅ | Min 32 chars — signs session cookies |
-| `AUTHZ_SIGNING_SECRET` | ✅ | Min 32 chars — signs authorization tokens |
-| `RESEND_API_KEY` | ✅ | Resend API key for real email MFA delivery |
-| `NEXT_PUBLIC_APP_URL` | ✅ | Website 1 URL (`http://localhost:3000`) |
-| `DEV_MODE` | — | `true` enables mock IdP and dev tools |
-| `AUTHZ_TTL_SECONDS` | — | Token lifetime in seconds (default: `300`) |
-| `RATE_LIMIT_MAX` | — | Max requests per window (default: `5`) |
-| `ADMIN_SECRET` | — | Dev-only admin header secret |
-
-### 📁 Project Structure
-
-```
-├── app/
-│   ├── api/
-│   │   ├── auth/          # SSO callback, MFA, logout, session
-│   │   ├── authz/         # Exchange code, token exchange, live verify
-│   │   ├── connect/       # Authorization grant endpoint
-│   │   └── admin/         # Admin: sessions, audit logs, revocation
-│   ├── dashboard/         # Authenticated dashboard with launch button
-│   └── mfa/               # MFA screen with anti-copy-paste protection
-├── lib/
-│   ├── auth/              # SSO config, PKCE, session, email MFA
-│   ├── authz-service/     # Token issuance, exchange codes, introspection
-│   ├── audit.ts           # Structured audit logging
-│   ├── rate-limit.ts      # Sliding-window rate limiter
-│   └── config.ts          # Central environment config
-├── prisma/
-│   ├── schema.prisma      # Full database schema
-│   ├── seed.ts            # Gateway seed data
-│   └── seed-dispatch.ts   # Operations Desk seed data
-├── __tests__/             # Vitest automated regression tests
-├── server-desk.ts         # Website 2 — Standalone Express server
-└── SECURITY-NOTES.md      # Mock vs production documentation
-```
-
-### 🔒 Security Notes
-
-See [SECURITY-NOTES.md](./SECURITY-NOTES.md) for full details on what is mocked vs production-ready.
-
-> **⚠️ Never deploy with `DEV_MODE=true` in production.** This flag:
-> - Activates the Mock IdP (anyone can sign in as any user)
-> - Accepts any 6-digit MFA code
-> - Enables admin access via a static header secret
+> **On Windows:** `pkill -f "next dev"` silently does nothing. Kill dev servers
+> by PID (`netstat -ano | findstr :3000`, then `taskkill /PID <pid> /F`) or you
+> will test code you already replaced.
 
 ---
 
-## 📄 License
+## 7. What is mocked
+
+| Component | State | Production replacement |
+|---|---|---|
+| Identity Provider | fully mocked | Real OIDC IdP |
+| MFA | fully mocked — `DEV_MODE` accepts any 6-digit code; **production path returns "not configured"** | Duo / Okta Verify / TOTP with vault-stored secrets |
+| Device key storage | real crypto, software-protected | WebAuthn platform authenticator with attestation |
+| Service-to-service auth | shared HMAC secret | mTLS with per-peer keys |
+| Gateway | own process, same host and database | Separate host, network-isolated by firewall, own datastore |
+| Gateway peer auth | HMAC, per-peer derived keys | mTLS with pinned, short-lived CA certificates |
+| Grant signing key | derived from a seed in-process | HSM / KMS handle |
+| Health monitor | separate process, **same database** | Separate infrastructure the app cannot write to |
+| Signing keys | env vars | HSM / secrets manager |
+| Audit sink | hash chain in the app DB | Append-only external store, anchored chain head |
+| Database | SQLite | PostgreSQL |
+| External alerting | `console.warn` stub | SIEM / pager integration |
+| Secondary notification channel | logged, not sent | Real SMS / push provider |
+
+Two structural limits worth naming: the Website 2 handshake store is in-memory
+and the audit chain is serialized in-process, so **both assume a single
+instance**. Multi-instance deployment needs shared state and a single chain
+writer.
+
+---
+
+## 8. What is left
+
+### Closed by this implementation
+
+Five of the specs' eight open items are now resolved: the Website 2 Session
+Guard (§6), the cross-system propagation channel (§22.3–22.4), clock-skew
+tolerance for the 5-minute grant, human confirmation for attacker-induced
+outages, and cryptographic device binding.
+
+### Still open
+
+| Item | Why it's still open |
+|---|---|
+| **Log data classification, retention, access control** (W1 §23, W2 §37) | Not implemented anywhere. Entries contain PII — IPs and employee identity tied to risk decisions. Needs a retention period, an access policy, and a classification for the store itself. Policy decision first, then code. |
+| **MFA override dual-control** (W1 §23) | The seam exists (`SECOND_APPROVER_REQUIRED` in `app/api/admin/mfa-override/route.ts`) but is off, because the architecture has **one administrator**. W2 §31 accepts this as residual risk. Unblocked only by provisioning a second administrator identity. |
+| **Device recovery flow detail** (W1 §22.5) | The flow, rate limits, and audit are built; the specific identity-reverification *steps* an administrator must perform are a policy question the spec leaves open. |
+
+### Beyond the specs
+
+- **Business authorization inside Website 2** — W2 §1 puts this explicitly out of
+  scope. The Desk currently authenticates who you are but does not restrict what
+  you may see or do. Any real deployment needs RBAC and data permissions.
+- **Production auth integration** — the mocked rows in §7 above.
+- **Multi-instance readiness** — shared handshake store, single audit writer.
+
+---
+
+## 9. Design decisions worth knowing
+
+Choices that are deliberate and would look like bugs otherwise:
+
+- **UA mismatch is worth very little.** Weighted so two telemetry signals
+  together cannot gate Connect on a proven device. Raising it re-creates the
+  problem device binding was introduced to solve.
+- **A failed device proof burns the nonce.** Deliberate — otherwise one live
+  challenge allows unlimited signature attempts.
+- **The authorization is consumed at session establishment, not at exchange.** A
+  handshake that fails Website 2's device check must not cost the employee their
+  grant.
+- **`revokeAllForUser` scopes the authorization sweep to match the session
+  sweep.** Unscoped revocation on a credential-scoped call breaks device
+  replacement — the new device's fresh grant gets killed by the old device's
+  revocation event.
+- **Rotation does not extend lifetimes.** It is a theft control.
+- **Website 2's out-of-band revoke endpoint contains exactly one operation.** §26
+  forbids it creating sessions or credentials; that is guaranteed by there being
+  no code for it, not by a check.
+
+---
+
+## 10. Document map
+
+| Document | What it is |
+|---|---|
+| `website-1-defense.md` | Authoritative design — portal, Connect, Mini EDR, admin, emergency |
+| `website-2-defense.md` | Authoritative design — Session Guard, device lifecycle, events |
+| `gateway-defense.md` | Authoritative design — Gateway hardening and blast radius |
+| `SECURITY-NOTES.md` | Mock vs real, per component, with a §-by-§ implementation map |
+| `threat-model.md` | Threat analysis |
+| `security-controls.md` | Threat-to-control mapping |
+
+---
+
+## License
 
 MIT
